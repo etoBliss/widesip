@@ -120,7 +120,7 @@ export function SignInForm() {
     const data = new FormData(event.currentTarget);
     if(captchaEnabled && !challenge.token){setError("Complete the security check before signing in.");setBusy(false);return;}
     try {
-      const response = await fetch(`${api}/api/auth/sign-in/email`, { method: "POST", credentials: "include", headers: challengeHeaders(challenge.token), body: JSON.stringify({ email: data.get("email"), password: data.get("password"), rememberMe: true }) });
+      const response = await fetch(`${api}/api/auth/sign-in/email`, { method: "POST", credentials: "include", headers: challengeHeaders(challenge.token), body: JSON.stringify({ email: data.get("email"), password: data.get("password"), rememberMe: true, callbackURL: new URL("/app", window.location.origin).toString() }) });
       const result = await readAuthResponse(response);
       if (!response.ok) throw new Error(result.message ?? result.error?.message ?? `Sign-in failed (HTTP ${response.status}). Check the API terminal for the server error.`);
       router.push(getSafeNext() || "/app");
