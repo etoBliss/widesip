@@ -74,12 +74,33 @@ export default function CampaignsPage() {
   useEffect(() => {
     if (!workspaceId) return;
     let active = true;
+    let loadingUpdate = false;
+    let debounce: number | undefined;
+    let recovery: number | undefined;
     const update = () => {
-      if (active && document.visibilityState === "visible") void load(workspaceId).catch(e => { if (active) setError(e instanceof Error ? e.message : "Could not update campaigns."); });
+      if (!active || loadingUpdate || document.visibilityState !== "visible") return;
+      loadingUpdate = true;
+      void load(workspaceId).catch(e => { if (active) setError(e instanceof Error ? e.message : "Could not update campaigns."); }).finally(() => { loadingUpdate = false; });
     };
-    const timer = window.setInterval(update, 15_000);
+    const scheduleUpdate = () => {
+      if (debounce !== undefined) window.clearTimeout(debounce);
+      debounce = window.setTimeout(update, 250);
+    };
+    const stream = new EventSource(`${api}/v1/events/inbox?workspaceId=${encodeURIComponent(workspaceId)}`, { withCredentials: true });
+    stream.addEventListener("campaign-update", scheduleUpdate);
+    stream.addEventListener("ready", scheduleUpdate);
+    stream.onopen = () => { if (recovery !== undefined) window.clearInterval(recovery); recovery = undefined; };
+    stream.onerror = () => { if (recovery === undefined) recovery = window.setInterval(update, 60_000); };
     window.addEventListener("focus", update);
-    return () => { active = false; window.clearInterval(timer); window.removeEventListener("focus", update); };
+    document.addEventListener("visibilitychange", update);
+    return () => {
+      active = false;
+      stream.close();
+      if (debounce !== undefined) window.clearTimeout(debounce);
+      if (recovery !== undefined) window.clearInterval(recovery);
+      window.removeEventListener("focus", update);
+      document.removeEventListener("visibilitychange", update);
+    };
   }, [workspaceId]);
   async function saveDraft(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); setSaving(true); setError(""); setNotice(""); const form = event.currentTarget; const v = new FormData(form);

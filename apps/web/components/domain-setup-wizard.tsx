@@ -7,7 +7,8 @@ import Link from "next/link";
 const api = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:4000";
 type DnsRecord = { type: string; name: string; value: string; priority?: number | null; ttl?: string | number };
 type Domain = { id: string; domainName: string; verificationStatus: string; mailStatus: string; receivingEnabled: boolean; dnsVerification: null | { type: "TXT"; name: string; hostname: string; value: string; expiresAt: string; status: string } };
-type Setup = { status: string; verified?: boolean; receivingEnabled?: boolean; receivingStatus?: string; dnsAutomated?: boolean; receiveWebhookUrl?: string | null; records?: DnsRecord[]; message: string };
+type Setup = { status: string; verified?: boolean; receivingEnabled?: boolean; receivingStatus?: string; dnsAutomated?: boolean; records?: DnsRecord[]; message: string };
+type CloudflareStatus = { connected: boolean; zoneName: string | null; canManage: boolean; configured: boolean };
 type Result<T> = { success?: boolean; data?: T; error?: { message?: string } };
 
 const steps = ["Domain added", "Verify ownership", "Set up email", "Domain profile"];
@@ -19,7 +20,7 @@ export function DomainSetupWizard({ domainId }: { domainId: string }) {
   const [receivingTouched, setReceivingTouched] = useState(false);
   const [records, setRecords] = useState<DnsRecord[]>([]);
   const [dnsAutomated, setDnsAutomated] = useState(false);
-  const [receiveWebhookUrl, setReceiveWebhookUrl] = useState<string | null>(null);
+  const [cloudflare, setCloudflare] = useState<CloudflareStatus | null>(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -37,8 +38,26 @@ export function DomainSetupWizard({ domainId }: { domainId: string }) {
         if (!response.ok) throw new Error(result.error?.message ?? "Could not load this domain.");
         const found = result.data?.find(item => item.id === domainId);
         if (!found) throw new Error("This domain is not available in the selected workspace.");
+        const cloudflareResponse = await fetch(`${api}/v1/domains/${domainId}/cloudflare/status`, { credentials: "include" });
+        const cloudflareResult = await cloudflareResponse.json() as Result<CloudflareStatus>;
         if (!active) return;
         setDomain(found); setReceiving(found.receivingEnabled);
+        if (cloudflareResponse.ok && cloudflareResult.data) setCloudflare(cloudflareResult.data);
+        const cloudflareResultCode = new URLSearchParams(window.location.search).get("cloudflare");
+        const cloudflareMessages: Record<string, string> = {
+          connected: "Cloudflare is connected for this organization. Widesip can now add compatible DNS records automatically.",
+          "zone-not-found": "Cloudflare was authorized, but this domain was not found in that account. Confirm the right account and try again.",
+          "sign-in-required": "Your Widesip session ended while connecting Cloudflare. Sign in and start the connection again.",
+          expired: "The Cloudflare connection expired before it completed. Start the connection again.",
+          "domain-changed": "This domain is no longer verified. Verify it again before connecting Cloudflare.",
+          "access-changed": "Your organization access changed before Cloudflare finished connecting.",
+          failed: "Cloudflare could not complete the connection. Try again or use the manual DNS records.",
+        };
+        if (cloudflareResultCode && cloudflareMessages[cloudflareResultCode]) {
+          setNotice(cloudflareMessages[cloudflareResultCode]);
+          window.history.replaceState({}, "", window.location.pathname);
+          if (cloudflareResponse.ok && cloudflareResult.data) setCloudflare(cloudflareResult.data);
+        }
         if (found.verificationStatus !== "verified") setStep(2);
         else if (found.mailStatus !== "active") setStep(3);
         else setStep(4);
@@ -67,7 +86,7 @@ export function DomainSetupWizard({ domainId }: { domainId: string }) {
       const response = await fetch(`${api}/v1/domains/${domainId}/mail-setup`, { method: "POST", credentials: "include", headers: { "Content-Type": "application/json" }, body: JSON.stringify(receivingTouched ? { receiving } : {}) });
       const result = await response.json() as Result<Setup>;
       if (!response.ok || !result.data) throw new Error(result.error?.message ?? "Could not prepare this domain's email setup.");
-      setRecords(result.data.records ?? []); setDnsAutomated(Boolean(result.data.dnsAutomated)); setReceiveWebhookUrl(result.data.receiveWebhookUrl ?? null); setNotice(result.data.message);
+      setRecords(result.data.records ?? []); setDnsAutomated(Boolean(result.data.dnsAutomated)); setNotice(result.data.message);
       setDomain(current => current ? { ...current, mailStatus: result.data!.verified || result.data!.status === "verified" ? "active" : "pending", receivingEnabled: result.data!.receivingEnabled ?? receiving } : current);
       setReceiving(result.data.receivingEnabled ?? receiving); setReceivingTouched(false);
       if (result.data.verified || result.data.status === "verified") setStep(4);
@@ -85,6 +104,19 @@ export function DomainSetupWizard({ domainId }: { domainId: string }) {
       if (result.data.verified) { setDomain(current => current ? { ...current, mailStatus: "active", receivingEnabled: result.data!.receivingEnabled ?? current.receivingEnabled } : current); setStep(4); }
     } catch (cause) { setError(cause instanceof Error ? cause.message : "Could not check mail DNS."); }
     finally { setBusy(false); }
+  }
+
+  async function connectCloudflare() {
+    setBusy(true); setError(""); setNotice("");
+    try {
+      const response = await fetch(`${api}/v1/domains/${domainId}/cloudflare/connect`, { method: "POST", credentials: "include", headers: { "Content-Type": "application/json" }, body: "{}" });
+      const result = await response.json() as Result<{ authorizationUrl: string }>;
+      if (!response.ok || !result.data?.authorizationUrl) throw new Error(result.error?.message ?? "Could not start Cloudflare authorization.");
+      window.location.assign(result.data.authorizationUrl);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not connect Cloudflare.");
+      setBusy(false);
+    }
   }
 
   async function copy(value: string, key: string) {
@@ -109,9 +141,10 @@ export function DomainSetupWizard({ domainId }: { domainId: string }) {
           <div className="domain-capability-card"><span className="domain-capability-icon"><ArrowRight size={16}/></span><div><b>Send from addresses on this domain</b><p>Widesip prepares SPF and DKIM records so mail providers can authenticate mail sent by your addresses. This does not route incoming mail.</p><span className="domain-capability-status"><Check size={12}/> Included</span></div></div>
           <label className="domain-receiving-choice"><input type="checkbox" checked={receiving} onChange={event => { setReceiving(event.target.checked); setReceivingTouched(true); }}/><span><b>Also receive incoming mail in Widesip</b><small>Receiving uses MX records. They control inbound routing for the domain; changing existing MX records can interrupt Google Workspace or another mail provider.</small></span></label>
           {receiving && <div className="domain-mx-warning"><CircleAlert size={17}/><p><b>Check your current MX records first.</b> If this domain already receives mail elsewhere, use a dedicated subdomain for Widesip or leave receiving off. Widesip will stop if it detects a conflicting MX route.</p></div>}
-          <div className="domain-automation-note"><Waypoints size={15}/><p>{dnsAutomated ? "DNS automation is active for this environment." : "Add the displayed records at your DNS provider. Existing conflicting mail routes are left untouched."} A future workspace can use a DNS connection to remove these manual steps.</p></div>
+          <div className="domain-automation-note"><Waypoints size={15}/><p>{dnsAutomated ? `DNS automation is active for ${cloudflare?.zoneName ?? "the connected Cloudflare zone"}.` : "Add the displayed records at your DNS provider. Existing conflicting mail routes are left untouched."} {cloudflare?.connected ? "Cloudflare is linked to this organization." : "Connect Cloudflare to add compatible DNS records automatically."}</p></div>
+          {!cloudflare?.connected && cloudflare?.configured && cloudflare.canManage && <div className="domain-wizard-actions"><button className="button secondary" type="button" disabled={busy} onClick={() => void connectCloudflare()}>{busy ? "Connecting…" : "Connect Cloudflare"}<ArrowRight size={15}/></button></div>}
           {records.length > 0 && <div className="sending-records"><b>{dnsAutomated ? "DNS records applied by Widesip" : "DNS records to add"}</b><p>{receiving ? "Includes records for sending and receiving." : "These records authenticate sending. Incoming routing stays with your current mail provider."}</p><div className="table-wrap"><table className="table"><thead><tr><th>Type</th><th>Name / host</th><th>Value</th></tr></thead><tbody>{records.map((record,index)=><tr key={`${record.type}-${record.name}-${index}`}><td>{record.type}{record.type.toUpperCase()==="MX"&&record.priority!=null?` · ${record.priority}`:""}</td><td><code>{record.name}</code></td><td><code>{record.value}</code></td></tr>)}</tbody></table></div></div>}
-          {receiving && records.length > 0 && (receiveWebhookUrl ? <div className="domain-webhook-guide"><b>One last receiving step: connect the webhook</b><p>In your Resend account, add a webhook and subscribe to the <code>email.received</code> event. Use this endpoint so incoming messages appear in Widesip:</p><code>{receiveWebhookUrl}</code><button type="button" className="copy-button" onClick={() => void copy(receiveWebhookUrl, "webhook")}>{copied === "webhook" ? "Copied" : <><Copy size={12}/> Copy endpoint</>}</button><small>Keep the webhook signing secret in your server’s <code>RESEND_WEBHOOK_SECRET</code> setting. Never paste it into this page.</small></div> : <div className="domain-mx-warning"><CircleAlert size={17}/><p>Incoming DNS is enabled, but Widesip has no public HTTPS API address yet. Set <code>WIDESIP_PUBLIC_URL</code> before connecting the Resend <code>email.received</code> webhook; receiving will not appear in the inbox until that webhook is active.</p></div>)}
+            {receiving && records.length > 0 && <div className="domain-webhook-guide"><b>Incoming mail is managed by Widesip</b><p>{dnsAutomated ? "Widesip applied the required incoming DNS records to your connected Cloudflare zone." : "Add the displayed incoming MX records at your DNS provider."} Widesip connects the receiving service centrally, so your organization does not need a separate Resend account or webhook.</p></div>}
           <div className="domain-wizard-actions"><button className="button" disabled={busy} onClick={() => void setupMail()}>{busy ? "Preparing records…" : records.length ? "Refresh records and status" : "Prepare email setup"}<ArrowRight size={15}/></button>{records.length > 0 && <button className="button secondary" disabled={busy} onClick={() => void checkMail()}><RefreshCw size={14}/> Check mail DNS</button>}</div>
         </div>}
         {step === 4 && <div className="domain-wizard-content"><div className="domain-wizard-heading"><span className="domain-wizard-icon"><Palette size={21}/></span><div><span className="usage-section-kicker">STEP 4 OF 4 · DOMAIN IDENTITY</span><h2>Give this domain one shared identity</h2><p>Set the profile image and brand once. Widesip uses it across addresses on this domain and in campaign design.</p></div></div>

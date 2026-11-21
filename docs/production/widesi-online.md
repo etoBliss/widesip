@@ -57,7 +57,7 @@ TURNSTILE_SECRET_KEY=<production Cloudflare Turnstile secret>
 
 Create the Cloudflare Turnstile widget for `widesi.online` and `www.widesi.online`. Production auth intentionally refuses missing or test Turnstile keys.
 
-Do **not** set `CLOUDFLARE_API_TOKEN` or `CLOUDFLARE_ZONE_ID` on the production API yet. The current token integration targets one zone; it must not be used to edit arbitrary customers' domains. Customer DNS automation needs per-customer Cloudflare OAuth and a proper consent flow first. Until then, the app displays DNS records for users to add themselves.
+Keep `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ZONE_ID` out of production. That static token is for local testing only; production customer DNS automation uses each organization's Cloudflare OAuth authorization. When an organization does not connect Cloudflare, Widesip displays records for manual DNS setup.
 
 Add `api.widesi.online` to Railway's API service. Copy the CNAME and TXT verification values Railway displays into Cloudflare exactly as shown. Keep the API record DNS-only initially; Railway then validates the custom hostname and provisions TLS.
 
@@ -97,7 +97,7 @@ https://api.widesi.online/v1/webhooks/resend
 
 Subscribe to the inbound and delivery events Widesip uses, then place the webhook signing secret in `RESEND_WEBHOOK_SECRET`. Keep a separate webhook and secret for local/staging if those environments use a public tunnel.
 
-Widesip owns this Resend integration. Customers do not need their own Resend accounts. Customers still need to publish the DNS records for their sending domains; automatic Cloudflare changes are not production-enabled yet.
+Widesip owns this Resend integration. Customers do not need their own Resend accounts. Customers can publish the displayed DNS records manually, or authorize Widesip's Cloudflare OAuth integration for the verified domain. OAuth writes are scoped to that customer zone; the Widesip company zone token is never used to edit customer DNS.
 
 ## Before inviting real customers
 
@@ -108,4 +108,36 @@ Widesip owns this Resend integration. Customers do not need their own Resend acc
 - Review multi-tenant access controls and run an independent security review before accepting customer mail.
 
 **Privacy boundary:** Widesip's current mail flow is not end-to-end encrypted. The API and database process/store message content, and Resend processes outbound/inbound delivery. HTTPS protects network connections; it does not make mail invisible to the service or encrypt it for recipients. Do not promise end-to-end encryption until that architecture exists.
+
+## Production readiness work still required
+
+The repository has a working production deployment path, but these features need the following production-specific work before Widesip should be treated as ready for general customer traffic:
+
+### Cloudflare customer connections
+
+- Production DNS automation uses a Cloudflare OAuth client that an organization owner or admin authorizes for each verified domain. Never use Widesip's own zone token to change customer zones.
+- Register a server-side authorization-code OAuth client on the verified `widesi.online` domain. Request only the Cloudflare DNS read/write permissions needed for DNS setup. Widesip stores OAuth state and PKCE data server-side, encrypts customer tokens at rest with AES-256-GCM, and associates each consent with a verified workspace domain and matched zone.
+- In Cloudflare, public OAuth clients require client-domain ownership verification. OAuth clients support the authorization-code flow; private clients only work for members of the client owner's account. See [Cloudflare OAuth client setup](https://developers.cloudflare.com/fundamentals/oauth/create-an-oauth-client/) and [OAuth integration endpoints](https://developers.cloudflare.com/fundamentals/oauth/integrate-with-cloudflare/).
+- Configure the OAuth client ID, secret, exact scope IDs, redirect URI `https://api.widesi.online/v1/integrations/cloudflare/callback`, and a base64-encoded random 32-byte encryption key in Railway. Generate the key with `node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"`. Keep these values in Railway only. The client uses authorization code + PKCE and refresh tokens, so enable the `refresh_token` grant and include `offline_access`; request the narrow `zone.read`, `dns.read`, and `dns.write` scopes supported by the client. Confirm the exact IDs against Cloudflare's OAuth scope list and select only DNS/zone permissions, not account-wide permissions. Production DNS writes read existing records first, preserve conflicts and root MX routes, and retain copyable DNS records as a fallback when Cloudflare is not connected. Cloudflare documents OAuth scope selection and the supported scope API in [OAuth client setup](https://developers.cloudflare.com/fundamentals/oauth/create-an-oauth-client/) and its [OAuth client API](https://developers.cloudflare.com/api/resources/iam/subresources/oauth_clients/).
+
+### Contact collection on customer sites
+
+- This is an organization's public contact/newsletter collection form, not Widesip account signup. The Contact page's copied widget script opens the form in a modal iframe. A visitor submits their name, email, and explicit email consent; the record is saved directly to that organization's Contacts. The high-entropy link token identifies the target list; customers and visitors do not need Resend accounts.
+- Production security headers are applied before route responses. Authenticated pages deny framing; only the public contact-collection iframe permits framing. Collection, compose, and test-send rate limits are stored in PostgreSQL so they apply across API replicas.
+- The checkbox is currently the consent record; there is no email-confirmation/double-opt-in step. Decide whether to require double opt-in before large-scale newsletter use. Keep unsubscribe and complaint suppression effective if that flow is added.
+
+### Resend production setup
+
+- Use the Widesip company Resend account and a verified sender such as `accounts@notify.widesi.online` for Widesip account emails. Customers should not create Resend accounts.
+- Add the sending DNS records Resend provides for `notify.widesi.online`, then set `RESEND_API_KEY`, `RESEND_FROM`, and `RESEND_WEBHOOK_SECRET` in Railway's production environment. Never place the API or webhook secret in Vercel or a `NEXT_PUBLIC_*` variable.
+- Register `https://api.widesi.online/v1/webhooks/resend` and subscribe to `email.received`, `email.sent`, `email.delivered`, `email.delivery_delayed`, `email.bounced`, `email.complained`, and `email.suppressed`. Resend signs webhook requests and retries failed deliveries; Widesip verifies the signature and should be monitored for non-2xx responses. See [Resend webhooks](https://resend.com/features/webhooks) and [Resend inbound email](https://www.resend.com/features/inbound).
+- Organization sending domains remain separate Resend domains owned by the Widesip integration. Users publish the DNS records Widesip displays; they do not supply provider credentials. Receiving requires the receiving MX records and the production webhook. Do not replace a customer's existing root MX records without explicit confirmation.
+- `GET /ready` checks database connectivity plus production email and customer Cloudflare OAuth configuration without returning secret values. Keep `/health` as Railway's basic liveness check; use `/ready` as the pre-launch readiness check after configuration is complete.
+
+### Campaigns and inbox scale
+
+- Campaign sends are now queued in PostgreSQL, claimed safely across API replicas, retried with backoff, and sent with a stable Resend idempotency key. Local development is capped at 25 recipients; production is capped at 10,000 per campaign. Add per-workspace daily/monthly quotas, billing enforcement, abuse review, and queue age/attempt alerts before broad customer access.
+- The inbox uses PostgreSQL notifications and authenticated Server-Sent Events for live updates. Browsers refresh after reconnect and while returning to a visible tab; a 60-second recovery refresh runs only while the event stream is unavailable. PostgreSQL notifications are transient, so keep the reconnect refresh and add monitoring for event-stream/database connection exhaustion.
+- Attachments are currently carried in request/database payloads. Move them to private object storage with short-lived download URLs, malware scanning, retention/deletion rules, and strict size limits before supporting larger production traffic.
+- Decide whether to require double opt-in for public newsletter forms. Keep suppression checks effective for bounced, complained, unsubscribed, and provider-suppressed recipients. Add durable webhook event idempotency, automated database restore drills, and alerting before broad release.
 

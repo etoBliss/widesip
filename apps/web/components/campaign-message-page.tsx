@@ -43,6 +43,39 @@ export function CampaignMessagePage({ campaignId }: { campaignId: string }) {
     return () => { active = false; };
   }, [load]);
 
+  useEffect(() => {
+    const workspaceId = localStorage.getItem("widesip.workspace") ?? "";
+    if (!workspaceId) return;
+    let active = true;
+    let loadingUpdate = false;
+    let debounce: number | undefined;
+    let recovery: number | undefined;
+    const update = () => {
+      if (!active || loadingUpdate || document.visibilityState !== "visible") return;
+      loadingUpdate = true;
+      void load().catch(cause => { if (active) setError(cause instanceof Error ? cause.message : "Could not update campaign activity."); }).finally(() => { loadingUpdate = false; });
+    };
+    const scheduleUpdate = () => {
+      if (debounce !== undefined) window.clearTimeout(debounce);
+      debounce = window.setTimeout(update, 250);
+    };
+    const stream = new EventSource(`${api}/v1/events/inbox?workspaceId=${encodeURIComponent(workspaceId)}`, { withCredentials: true });
+    stream.addEventListener("campaign-update", scheduleUpdate);
+    stream.addEventListener("ready", scheduleUpdate);
+    stream.onopen = () => { if (recovery !== undefined) window.clearInterval(recovery); recovery = undefined; };
+    stream.onerror = () => { if (recovery === undefined) recovery = window.setInterval(update, 60_000); };
+    window.addEventListener("focus", update);
+    document.addEventListener("visibilitychange", update);
+    return () => {
+      active = false;
+      stream.close();
+      if (debounce !== undefined) window.clearTimeout(debounce);
+      if (recovery !== undefined) window.clearInterval(recovery);
+      window.removeEventListener("focus", update);
+      document.removeEventListener("visibilitychange", update);
+    };
+  }, [load]);
+
   async function runAction(action: "send" | "cancel-schedule") {
     if (!campaign || busy) return;
     const prompt = action === "send"

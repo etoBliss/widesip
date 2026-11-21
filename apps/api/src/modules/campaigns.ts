@@ -1,7 +1,7 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 import express, { type NextFunction, type Request, type Response } from "express";
 import { fromNodeHeaders } from "better-auth/node";
-import { and, asc, desc, eq, inArray, isNull, notExists, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, lte, lt, notExists, or, sql } from "drizzle-orm";
 import { auth } from "../auth.js";
 import { campaignRecipients, campaigns, campaignTemplates, contacts, db, domainEmailTemplates, domains, mailboxAccess, mailboxes, workspaceMembers } from "@widesip/database";
 import { campaignCreateSchema, campaignTemplateCreateSchema, campaignUpdateSchema } from "@widesip/validation";
@@ -12,7 +12,9 @@ import { personalizeCampaignText, validateEmailAttachments } from "./mail/attach
 type AuthedRequest = Request & { userId?: string };
 const router = express.Router();
 const MAX_LOCAL_RECIPIENTS = 25;
+const MAX_PRODUCTION_RECIPIENTS = 10_000;
 const MAX_SCHEDULE_MS = 30 * 24 * 60 * 60 * 1000;
+let queueTickActive = false;
 
 async function requireUser(req: AuthedRequest, res: Response, next: NextFunction) {
   try {
@@ -39,6 +41,95 @@ function scheduleError(value: string | null | undefined) {
   if (time > Date.now() + MAX_SCHEDULE_MS) return "Resend supports scheduled sends up to 30 days ahead.";
   return null;
 }
+
+async function updateCampaignQueueStatus(campaignId: string) {
+  const states = await db.select({ status: campaignRecipients.status }).from(campaignRecipients).where(eq(campaignRecipients.campaignId, campaignId));
+  if (!states.length || states.some(row => row.status === "queued" || row.status === "processing")) return;
+  const scheduled = states.some(row => row.status === "scheduled");
+  const accepted = states.filter(row => ["sent", "scheduled", "delivered", "delivery_delayed", "bounced", "complained", "suppressed"].includes(row.status)).length;
+  const status = scheduled && accepted === states.length ? "scheduled" : accepted === states.length ? "sent" : accepted ? "partial" : "failed";
+  await db.update(campaigns).set({ status, sentAt: status === "scheduled" ? null : new Date(), updatedAt: new Date() })
+    .where(and(eq(campaigns.id, campaignId), eq(campaigns.status, "sending")));
+}
+
+async function processCampaignQueueBatch() {
+  if (queueTickActive) return;
+  queueTickActive = true;
+  try {
+    const now = new Date();
+    const staleBefore = new Date(now.getTime() - 10 * 60_000);
+    const candidates = await db.select({
+      recipientId: campaignRecipients.id, campaignId: campaigns.id, email: campaignRecipients.email,
+      recipientName: campaignRecipients.recipientName, attempts: campaignRecipients.attempts,
+      subject: campaigns.subject, body: campaigns.body, attachments: campaigns.attachments,
+      scheduledAt: campaigns.scheduledAt, displayName: mailboxes.displayName, localPart: mailboxes.localPart,
+      domainName: domains.domainName, domainId: domains.id, brandName: domainEmailTemplates.brandName,
+      logoUrl: domainEmailTemplates.logoUrl, logoImageData: domainEmailTemplates.logoImageData,
+      accentColor: domainEmailTemplates.accentColor, footerText: domainEmailTemplates.footerText,
+    }).from(campaignRecipients)
+      .innerJoin(campaigns, eq(campaigns.id, campaignRecipients.campaignId))
+      .innerJoin(mailboxes, eq(mailboxes.id, campaigns.mailboxId))
+      .innerJoin(domains, eq(domains.id, mailboxes.domainId))
+      .leftJoin(domainEmailTemplates, eq(domainEmailTemplates.domainId, domains.id))
+      .where(and(eq(campaigns.status, "sending"), or(
+        and(eq(campaignRecipients.status, "queued"), lte(campaignRecipients.availableAt, now)),
+        and(eq(campaignRecipients.status, "processing"), lt(campaignRecipients.claimedAt, staleBefore)),
+      )))
+      .orderBy(asc(campaignRecipients.createdAt)).limit(8);
+
+    await Promise.all(candidates.map(async candidate => {
+      const claimedAt = new Date();
+      const [claim] = await db.update(campaignRecipients).set({ status: "processing", claimedAt, attempts: sql`${campaignRecipients.attempts} + 1` })
+        .where(and(eq(campaignRecipients.id, candidate.recipientId), or(
+          and(eq(campaignRecipients.status, "queued"), lte(campaignRecipients.availableAt, claimedAt)),
+          and(eq(campaignRecipients.status, "processing"), lt(campaignRecipients.claimedAt, staleBefore)),
+        ))).returning({ id: campaignRecipients.id });
+      if (!claim) return;
+      const attempt = candidate.attempts + 1;
+      try {
+        const publicUrl = process.env.WIDESIP_PUBLIC_URL?.replace(/\/$/, "");
+        const secret = process.env.CAMPAIGN_UNSUBSCRIBE_SECRET;
+        if (!publicUrl || !/^https:\/\//i.test(publicUrl) || !secret || secret.length < 32) throw new Error("Campaign unsubscribe configuration is missing.");
+        const name = candidate.recipientName ?? "";
+        const contact = { id: null, email: candidate.email, name, consentSource: null, consentAt: null };
+        const unsubscribeUrl = `${publicUrl}/v1/unsubscribe/${encodeURIComponent(tokenForRecipient(candidate.recipientId))}`;
+        const safeName = candidate.displayName.replace(/[\r\n<>\"]/g, "").trim() || "Widesip";
+        const personalizedSubject = personalizeCampaignText(candidate.subject, contact);
+        const personalizedBody = personalizeCampaignText(candidate.body, contact);
+        const template = { brandName: candidate.brandName || safeName, logoUrl: candidate.logoImageData ? `${publicUrl}/v1/public/domains/${candidate.domainId}/logo` : candidate.logoUrl, accentColor: candidate.accentColor || "#4165e8", footerText: candidate.footerText || "" };
+        const textFooter = candidate.footerText ? `\n\n${candidate.footerText}` : "";
+        const result = await getMailProvider().send({
+          from: `${safeName} <${candidate.localPart}@${candidate.domainName}>`, to: [candidate.email],
+          subject: personalizedSubject,
+          text: `${personalizedBody}${textFooter}\n\n-\nUnsubscribe from these emails: ${unsubscribeUrl}`,
+          html: renderCampaignHtml({ subject: personalizedSubject, body: personalizedBody, unsubscribeUrl, template }),
+          headers: { "List-Unsubscribe": `<${unsubscribeUrl}>`, "List-Unsubscribe-Post": "List-Unsubscribe=One-Click" },
+          attachments: candidate.attachments.map(file => ({ filename: file.filename, content: file.content, content_type: file.contentType })),
+          tags: [{ name: "campaign_id", value: candidate.campaignId }, { name: "recipient_id", value: candidate.recipientId }],
+          ...(candidate.scheduledAt ? { scheduledAt: candidate.scheduledAt.toISOString() } : {}),
+          idempotencyKey: `campaign-recipient-${candidate.recipientId}`,
+        });
+        await db.update(campaignRecipients).set({ status: candidate.scheduledAt ? "scheduled" : "sent", providerMessageId: result.id, sentAt: candidate.scheduledAt ? null : new Date(), claimedAt: null, error: null })
+          .where(eq(campaignRecipients.id, candidate.recipientId));
+      } catch (error) {
+        const retry = attempt < 5;
+        const delayMs = Math.min(15 * 60_000, 30_000 * 2 ** (attempt - 1));
+        await db.update(campaignRecipients).set({
+          status: retry ? "queued" : "failed", claimedAt: null, availableAt: new Date(Date.now() + delayMs),
+          error: error instanceof Error ? error.message.slice(0, 500) : "Delivery request failed.",
+        }).where(eq(campaignRecipients.id, candidate.recipientId));
+      }
+    }));
+    for (const campaignId of new Set(candidates.map(candidate => candidate.campaignId))) {
+      await updateCampaignQueueStatus(campaignId);
+    }
+  } catch (error) {
+    console.error("[campaign-queue] Worker iteration failed", error instanceof Error ? error.message : "unknown error");
+  } finally { queueTickActive = false; }
+}
+
+const campaignQueueTimer = setInterval(() => void processCampaignQueueBatch(), 2_000);
+campaignQueueTimer.unref();
 function tokenFor(contactId: string) {
   const secret = process.env.CAMPAIGN_UNSUBSCRIBE_SECRET;
   if (!secret || secret.length < 32) throw new Error("Campaign unsubscribe secret is not configured.");
@@ -243,46 +334,35 @@ router.post("/v1/campaigns/:campaignId/send", requireUser, async (req: AuthedReq
       }
     } else if (campaign.audienceMode === "all_opted_in") {
       eligible = await db.select({ id: contacts.id, email: contacts.email, name: sql<string>`trim(concat_ws(' ', ${contacts.firstName}, ${contacts.lastName}))`, consentSource: contacts.consentSource, consentAt: contacts.consentAt }).from(contacts)
-        .where(and(eq(contacts.workspaceId, campaign.workspaceId), eq(contacts.consentStatus, "subscribed"), isNull(contacts.unsubscribedAt), priorSuppression)).orderBy(asc(contacts.createdAt)).limit(MAX_LOCAL_RECIPIENTS + 1);
+        .where(and(eq(contacts.workspaceId, campaign.workspaceId), eq(contacts.consentStatus, "subscribed"), isNull(contacts.unsubscribedAt), priorSuppression)).orderBy(asc(contacts.createdAt)).limit((process.env.NODE_ENV === "production" ? MAX_PRODUCTION_RECIPIENTS : MAX_LOCAL_RECIPIENTS) + 1);
     }
     const direct = campaign.manualRecipients.map(recipient => ({ id: null, email: recipient.email.trim().toLowerCase(), name: recipient.name, consentSource: "manual_consent_confirmation", consentAt: new Date() }));
     if (direct.length && !campaign.manualConsentConfirmed) return fail(res, 409, "CONSENT_CONFIRMATION_REQUIRED", "Confirm that each manually entered recipient agreed to receive this campaign.");
+    if (direct.length) {
+      const priorDirectSuppressions = await db.select({ email: campaignRecipients.email }).from(campaignRecipients)
+        .innerJoin(campaigns, eq(campaigns.id, campaignRecipients.campaignId))
+        .where(and(eq(campaigns.workspaceId, campaign.workspaceId),
+          inArray(sql<string>`lower(${campaignRecipients.email})`, direct.map(recipient => recipient.email)),
+          inArray(campaignRecipients.status, ["bounced", "complained", "suppressed", "unsubscribed"])));
+      const suppressed = new Set(priorDirectSuppressions.map(row => row.email.toLowerCase()));
+      if (direct.some(recipient => suppressed.has(recipient.email))) {
+        return fail(res, 409, "RECIPIENT_SUPPRESSED", "One or more manually entered addresses previously bounced, complained, or unsubscribed in this workspace. Remove those addresses before sending.");
+      }
+    }
     const seen = new Set(eligible.map(recipient => recipient.email.toLowerCase()));
     for (const recipient of direct) if (!seen.has(recipient.email)) { eligible.push(recipient); seen.add(recipient.email); }
     if (!eligible.length) return fail(res, 409, "NO_SUBSCRIBED_CONTACTS", "Choose opted-in contacts or add recipients who have agreed to receive this campaign.");
-    if (eligible.length > MAX_LOCAL_RECIPIENTS) return fail(res, 409, "LOCAL_SEND_CAP", `Local campaign sending is capped at ${MAX_LOCAL_RECIPIENTS} total recipients.`);
+    const recipientLimit = process.env.NODE_ENV === "production" ? MAX_PRODUCTION_RECIPIENTS : MAX_LOCAL_RECIPIENTS;
+    if (eligible.length > recipientLimit) return fail(res, 409, "RECIPIENT_CAP", `Campaigns can currently include up to ${recipientLimit.toLocaleString()} recipients.`);
     const reserved = await db.transaction(async tx => {
       const [locked] = await tx.update(campaigns).set({ status: "sending", recipientCount: eligible.length, updatedAt: new Date() }).where(and(eq(campaigns.id, campaign.id), eq(campaigns.status, "draft"))).returning({ id: campaigns.id });
       if (!locked) return false;
-      await tx.insert(campaignRecipients).values(eligible.map(contact => ({ campaignId: campaign.id, contactId: contact.id, email: contact.email, recipientName: contact.name || null, consentSource: contact.consentSource, consentAt: contact.consentAt })));
+      const rows = eligible.map(contact => ({ campaignId: campaign.id, contactId: contact.id, email: contact.email, recipientName: contact.name || null, consentSource: contact.consentSource, consentAt: contact.consentAt }));
+      for (let offset = 0; offset < rows.length; offset += 500) await tx.insert(campaignRecipients).values(rows.slice(offset, offset + 500));
       return true;
     });
     if (!reserved) return fail(res, 409, "CAMPAIGN_ALREADY_SENT", "This campaign is already being processed.");
-    const isScheduled = Boolean(campaign.scheduledAt);
-    const fromAddress = `${campaign.localPart}@${campaign.domainName}`;
-    const safeName = campaign.displayName.replace(/[\r\n<>\"]/g, "").trim() || "Widesip";
-    const from = `${safeName} <${fromAddress}>`;
-    let accepted = 0;
-    for (let index = 0; index < eligible.length; index++) {
-      const contact = eligible[index];
-      const recipientRow = await db.select({ id: campaignRecipients.id }).from(campaignRecipients).where(and(eq(campaignRecipients.campaignId, campaign.id), eq(campaignRecipients.email, contact.email))).limit(1).then(rows => rows[0]);
-      if (!recipientRow) continue;
-      const unsubscribeUrl = `${publicUrl}/v1/unsubscribe/${encodeURIComponent(tokenForRecipient(recipientRow.id))}`;
-      try {
-        const template = { brandName: campaign.brandName || safeName, logoUrl: campaign.logoImageData ? `${publicUrl}/v1/public/domains/${campaign.domainId}/logo` : campaign.logoUrl, accentColor: campaign.accentColor || "#4165e8", footerText: campaign.footerText || "" };
-        const textFooter = campaign.footerText ? `\n\n${campaign.footerText}` : "";
-        const personalizedSubject = personalizeCampaignText(campaign.subject, contact);
-        const personalizedBody = personalizeCampaignText(campaign.body, contact);
-        const result = await getMailProvider().send({ from, to: [contact.email], subject: personalizedSubject, text: `${personalizedBody}${textFooter}\n\n-\nUnsubscribe from these emails: ${unsubscribeUrl}`, html: renderCampaignHtml({ subject: personalizedSubject, body: personalizedBody, unsubscribeUrl, template }), headers: { "List-Unsubscribe": `<${unsubscribeUrl}>`, "List-Unsubscribe-Post": "List-Unsubscribe=One-Click" }, attachments: campaign.attachments.map(file => ({ filename: file.filename, content: file.content, content_type: file.contentType })), tags: [{ name: "campaign_id", value: campaign.id }, { name: "recipient_id", value: recipientRow.id }], ...(campaign.scheduledAt ? { scheduledAt: campaign.scheduledAt.toISOString() } : {}) });
-        await db.update(campaignRecipients).set({ status: isScheduled ? "scheduled" : "sent", providerMessageId: result.id, sentAt: isScheduled ? null : new Date() }).where(eq(campaignRecipients.id, recipientRow.id));
-        accepted++;
-      } catch (error) {
-        await db.update(campaignRecipients).set({ status: "failed", error: error instanceof Error ? error.message.slice(0, 500) : "Delivery request failed." }).where(eq(campaignRecipients.id, recipientRow.id));
-      }
-    }
-    const status = accepted === eligible.length ? (isScheduled ? "scheduled" : "sent") : accepted ? "partial" : "failed";
-    await db.update(campaigns).set({ status, sentAt: isScheduled ? null : new Date(), updatedAt: new Date() }).where(eq(campaigns.id, campaign.id));
-    return res.status(202).json({ success: true, data: { accepted, failed: eligible.length - accepted, status, message: isScheduled ? `${accepted} emails were accepted for scheduled delivery.` : `${accepted} of ${eligible.length} messages were accepted by the mail provider.` } });
+    return res.status(202).json({ success: true, data: { accepted: 0, queued: eligible.length, failed: 0, status: "sending", message: campaign.scheduledAt ? `${eligible.length} messages are queued for scheduled delivery.` : `${eligible.length} messages are queued for delivery.` } });
   } catch (error) { next(error); }
 });
 router.post("/v1/campaigns/:campaignId/cancel-schedule", requireUser, async (req: AuthedRequest, res, next) => {

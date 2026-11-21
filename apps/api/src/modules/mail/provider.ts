@@ -27,6 +27,7 @@ export type SendMessage = {
   attachments?: Array<{ filename: string; content: string; content_type?: string }>;
   scheduledAt?: string;
   tags?: Array<{ name: string; value: string }>;
+  idempotencyKey?: string;
 };
 
 export type ReceivedMessage = {
@@ -90,8 +91,8 @@ const resendProvider: MailProvider = {
     await resendRequest(`/domains/${encodeURIComponent(id)}/verify`, { method: "POST" });
   },
   send: (message) => {
-    const { scheduledAt, ...payload } = message;
-    return resendRequest<{ id: string }>("/emails", { method: "POST", body: JSON.stringify({ ...payload, ...(scheduledAt ? { scheduled_at: scheduledAt } : {}) }) });
+    const { scheduledAt, idempotencyKey, ...payload } = message;
+    return resendRequest<{ id: string }>("/emails", { method: "POST", headers: idempotencyKey ? { "Idempotency-Key": idempotencyKey } : {}, body: JSON.stringify({ ...payload, ...(scheduledAt ? { scheduled_at: scheduledAt } : {}) }) });
   },
   async cancelScheduled(id) {
     await resendRequest(`/emails/${encodeURIComponent(id)}/cancel`, { method: "POST" });

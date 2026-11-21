@@ -78,7 +78,7 @@ export const auth=betterAuth({
       }
     }),
   },
-  emailAndPassword:{enabled:true,minPasswordLength:12,maxPasswordLength:128,requireEmailVerification:true,revokeSessionsOnPasswordReset:true,resetPasswordTokenExpiresIn:3600,onPasswordReset:async({user})=>{void sendProductEmail(user.email,"Your Widesip password was changed","Your Widesip password was recently changed. If you did not make this change, contact support.").catch(error=>console.error("Password change notification failed",error));},sendResetPassword:async({user,url})=>{void sendProductEmail(user.email,"Reset your Widesip password",`Use this secure link to reset your password. The link expires shortly.\n\n${url}`).catch(error=>console.error("Password reset email failed",error));}},
+  emailAndPassword:{enabled:true,minPasswordLength:12,maxPasswordLength:128,requireEmailVerification:true,revokeSessionsOnPasswordReset:true,resetPasswordTokenExpiresIn:3600,onPasswordReset:async({user})=>{try{await sendProductEmail(user.email,"Your Widesip password was changed","Your Widesip password was recently changed. If you did not make this change, contact support.");}catch(error){console.error("Password change notification failed",error);}},sendResetPassword:async({user,url})=>{try{await sendProductEmail(user.email,"Reset your Widesip password",`Use this secure link to reset your password. The link expires shortly.\n\n${url}`);}catch(error){console.error("Password reset email failed",error);throw error;}}},
   user:{additionalFields:{
     accountType:{type:"string",required:true,input:true,defaultValue:"personal"},
     dateOfBirth:{type:"string",required:true,input:true},
@@ -103,7 +103,7 @@ export const auth=betterAuth({
     for(const row of authoredCampaigns){const owner=ownerByWorkspace.get(row.workspaceId);if(owner&&owner!==user.id)await db.update(campaigns).set({createdByUserId:owner}).where(eq(campaigns.id,row.id));}
     for(const row of authoredTemplates){const owner=ownerByWorkspace.get(row.workspaceId);if(owner&&owner!==user.id)await db.update(campaignTemplates).set({createdByUserId:owner}).where(eq(campaignTemplates.id,row.id));}
   }}},
-  emailVerification:{sendOnSignUp:true,sendOnSignIn:true,autoSignInAfterVerification:true,expiresIn:3600,sendVerificationEmail:async({user,url})=>{void sendProductEmail(user.email,"Verify your Widesip email",`Verify your email address to continue setting up Widesip.\n\n${url}`).catch(error=>console.error("Verification email failed",error));}},
+  emailVerification:{sendOnSignUp:true,sendOnSignIn:true,autoSignInAfterVerification:true,expiresIn:3600,sendVerificationEmail:async({user,url})=>{try{await sendProductEmail(user.email,"Verify your Widesip email",`Verify your email address to continue setting up Widesip.\n\n${url}`);}catch(error){console.error("Verification email failed",error);throw error;}}},
   session:{expiresIn:60*60*12,updateAge:60*60},
   advanced:{useSecureCookies:production,ipAddress:{ipAddressHeaders:["cf-connecting-ip"]}},
 });

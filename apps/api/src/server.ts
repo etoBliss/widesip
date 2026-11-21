@@ -1,9 +1,10 @@
 import express, { type NextFunction, type Request, type Response } from "express";
 import cors from "cors";
-import { randomBytes, createHash, createHmac, timingSafeEqual } from "node:crypto";
+import { Pool } from "pg";
+import { randomBytes, createHash, createHmac, timingSafeEqual, createCipheriv, createDecipheriv } from "node:crypto";
 import { resolveTxt } from "node:dns/promises";
 import { toNodeHandler, fromNodeHeaders } from "better-auth/node";
-import { and, asc, count, desc, eq, gt, gte, ilike, inArray, ne, or } from "drizzle-orm";
+import { and, asc, count, desc, eq, gt, gte, ilike, inArray, like, lt, ne, or, sql } from "drizzle-orm";
 import { auth } from "./auth.js";
 import { getMailProvider, type ProviderDomain } from "./modules/mail/provider.js";
 import { renderBrandedMessageHtml } from "./modules/mail/campaign-template.js";
@@ -11,25 +12,69 @@ import { classifyInboundMessage, normalizeSenderAddress } from "./modules/mail/c
 import { validateEmailAttachments } from "./modules/mail/attachments.js";
 import { campaignRouter, handleCampaignEmailEvent } from "./modules/campaigns.js";
 import { teamRouter } from "./modules/team.js";
-import { campaignRecipients, campaigns, contacts, db, domainEmailTemplates, domains, domainVerifications, emailAliases, mailboxAccess, mailboxes, messageCategoryRules, messageSenderProfiles, messages, sessions, users, workspaceInvitations, workspaceMembers, workspaces, workspaceSubscriptionLinks } from "@widesip/database";
+import { campaignRecipients, campaigns, cloudflareConnections, cloudflareOAuthStates, contacts, db, domainEmailTemplates, domains, domainVerifications, emailAliases, mailboxAccess, mailboxes, messageCategoryRules, messageSenderProfiles, messages, rateLimits, sessions, users, workspaceInvitations, workspaceMembers, workspaces, workspaceSubscriptionLinks } from "@widesip/database";
 import { aliasCreateSchema, composeEmailSchema, contactCreateSchema, contactUpdateSchema, domainCreateSchema, mailboxCreateSchema, sendTestEmailSchema, workspaceCreateSchema } from "@widesip/validation";
 
 type AuthedRequest = Request & { userId?: string };
 const app = express();
+const eventStreamPool = new Pool({ connectionString: process.env.DATABASE_URL, max: 32, application_name: "widesip-events" });
 const allowedOrigin = process.env.WEB_ORIGIN ?? "http://localhost:3000";
 const verificationRecordName = "_widesip-verification";
 const challengeLifetimeMs = 30 * 24 * 60 * 60 * 1000;
-const testSendAttempts = new Map<string, number[]>();
-const composeSendAttempts = new Map<string, number[]>();
-const publicSubscribeAttempts = new Map<string, number[]>();
 const usersWithPrivateSpaces = new Set<string>();
 function escapeHtml(value: string) { return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;").replaceAll("'", "&#39;"); }
-function subscriptionPage(token: string, state: "form" | "success" | "error" = "form", message = "", brandName = "Widesip", embedded = false) {
+async function consumeRateLimit(key: string, max: number, windowMs: number) {
+  const now = Date.now();
+  const resetBefore = now - windowMs;
+  const [entry] = await db.insert(rateLimits).values({ id: randomBytes(16).toString("hex"), key: `widesip:rl:${key}`, count: 1, lastRequest: now })
+    .onConflictDoUpdate({
+      target: rateLimits.key,
+      set: {
+        count: sql`case when ${rateLimits.lastRequest} <= ${resetBefore} then 1 else ${rateLimits.count} + 1 end`,
+        lastRequest: sql`case when ${rateLimits.lastRequest} <= ${resetBefore} then ${now} else ${rateLimits.lastRequest} end`,
+      },
+    }).returning({ count: rateLimits.count });
+  // Opportunistic cleanup keeps abandoned fingerprints from growing forever.
+  if (Math.random() < 0.01) {
+    await db.delete(rateLimits).where(and(like(rateLimits.key, "widesip:rl:%"), lt(rateLimits.lastRequest, now - 24 * 60 * 60 * 1000)));
+  }
+  return (entry?.count ?? max + 1) <= max;
+}
+function rateLimitFingerprint(scope: string, value: string) {
+  return createHmac("sha256", process.env.BETTER_AUTH_SECRET ?? "widesip-local-rate-limit")
+    .update(`${scope}:${value.trim().toLowerCase()}`).digest("hex");
+}
+
+// Apply security headers before any route can send a response. Keep the
+// externally embedded newsletter form as the only frameable HTML endpoint;
+// all API, auth, and other HTML responses deny framing.
+app.use((req, res, next) => {
+  const embeddedSignup = req.path.startsWith("/v1/subscribe/") && req.query.embed === "1";
+  const cspNonce = randomBytes(18).toString("base64");
+  res.locals.cspNonce = cspNonce;
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
+  res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
+  res.setHeader("Cache-Control", "no-store");
+  if (process.env.NODE_ENV === "production") res.setHeader("Strict-Transport-Security", "max-age=31536000");
+  if (embeddedSignup) {
+    // The form is intentionally embeddable by customer websites. It contains
+    // no authenticated data; the high-entropy public subscription token only
+    // identifies the target organization's signup list.
+    res.setHeader("Content-Security-Policy", `default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${cspNonce}'; form-action 'self'; base-uri 'none'; frame-ancestors *`);
+  } else {
+    res.setHeader("X-Frame-Options", "DENY");
+    res.setHeader("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'");
+  }
+  next();
+});
+
+function subscriptionPage(token: string, state: "form" | "success" | "error" = "form", message = "", brandName = "Widesip", embedded = false, cspNonce = "") {
   const content = state === "success"
     ? `<div class="success-mark">✓</div><h1>You’re on the list.</h1><p>Thanks for subscribing to ${escapeHtml(brandName)} updates. You can close this page.</p>`
     : `<span class="eyebrow">${escapeHtml(brandName)} NEWSLETTER</span><h1>Good things, in your inbox.</h1><p>Subscribe to receive updates and news. You can unsubscribe at any time.</p>${message ? `<div class="notice">${escapeHtml(message)}</div>` : ""}<form method="post" action="/v1/subscribe/${token}${embedded ? "?embed=1" : ""}"><label>First name <input name="firstName" maxlength="100" autocomplete="given-name" required></label><label>Last name <input name="lastName" maxlength="100" autocomplete="family-name"></label><label>Email address <input name="email" type="email" maxlength="254" required autocomplete="email" placeholder="you@example.com"></label><label class="consent"><input type="checkbox" name="consent" value="yes" required><span>I agree to receive newsletter emails. I can unsubscribe at any time.</span></label><div class="website-field" aria-hidden="true"><label>Leave this field empty<input name="website_url" tabindex="-1" autocomplete="off"></label></div><button type="submit">Subscribe</button><small>We’ll use your email only for ${escapeHtml(brandName)} email updates.</small></form>`;
   const embeddedCss = embedded ? ".embedded{background:transparent;min-height:auto;display:block;padding:8px}.embedded .card{width:100%;max-width:none;padding:24px;border:0;box-shadow:none}.embedded .mark{display:none}" : "";
-  const completionMessage = embedded && state === "success" ? '<script>try{parent.postMessage({type:"widesip:subscription-complete"},new URL(document.referrer).origin)}catch{}</script>' : "";
+  const completionMessage = embedded && state === "success" ? `<script nonce="${cspNonce}">try{parent.postMessage({type:"widesip:subscription-complete"},new URL(document.referrer).origin)}catch{}</script>` : "";
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light"><title>Subscribe - ${escapeHtml(brandName)}</title><style>*{box-sizing:border-box}body{min-height:100vh;margin:0;padding:24px;display:grid;place-items:center;background:#f5f7fb;color:#10233f;font:15px Arial,Helvetica,sans-serif}.card{width:min(100%,470px);padding:36px;background:#fff;border:1px solid #e5eaf2;border-radius:18px;box-shadow:0 24px 70px #10233f12}.mark{width:38px;height:38px;margin-bottom:24px;display:grid;place-items:center;border-radius:12px;background:#356ae6;color:#fff;font-size:20px;font-weight:700}.eyebrow{color:#356ae6;font-size:10px;font-weight:700;letter-spacing:.13em}.card h1{margin:11px 0;color:#10233f;font-size:30px;line-height:1.15;letter-spacing:-1px}.card p{margin:0 0 24px;color:#68778d;font-size:14px;line-height:1.7}.card form{display:grid;gap:15px}.card form>label:not(.consent){display:grid;gap:7px;color:#35465f;font-size:12px;font-weight:650}.card input:not([type=checkbox]){width:100%;height:45px;padding:0 12px;border:1px solid #dfe5ef;border-radius:9px;background:#fff;color:#10233f;font:14px Arial,Helvetica,sans-serif}.card input:focus{outline:3px solid #356ae61c;border-color:#356ae6}.consent{display:flex;gap:9px;align-items:flex-start;color:#68778d;font-size:11px;line-height:1.5}.consent input{margin-top:2px;accent-color:#356ae6}.card button{height:46px;border:0;border-radius:9px;background:#356ae6;color:#fff;font-size:13px;font-weight:700;cursor:pointer}.card button:hover{background:#2858c9}.card form>small{color:#8995a7;font-size:10px;line-height:1.5;text-align:center}.notice{margin:-8px 0 16px;padding:11px;border-radius:8px;background:#fff2ef;color:#a43f36;font-size:12px;line-height:1.5}.success-mark{width:44px;height:44px;margin-bottom:18px;display:grid;place-items:center;border-radius:50%;background:#e7f6ef;color:#13875d;font-size:24px;font-weight:bold}.website-field{position:absolute;left:-10000px;width:1px;height:1px;overflow:hidden}@media(max-width:520px){body{padding:15px}.card{padding:26px 21px;border-radius:14px}.card h1{font-size:26px}}${embeddedCss}</style></head><body class="${embedded ? "embedded" : ""}"><main class="card"><div class="mark">w</div>${content}</main>${completionMessage}</body></html>`;
 }
 function normalizedThreadSubject(subject: string) {
@@ -129,21 +174,11 @@ app.post("/v1/webhooks/resend", express.raw({ type: "application/json", limit: "
 });
 app.use(express.json({ limit: "12mb" }));
 app.use("/v1", (req: AuthedRequest, res, next) => {
-  if (req.path.startsWith("/public/") || req.path.startsWith("/subscribe/") || req.path.startsWith("/subscribe-widget/") || req.path === "/webhooks/resend" || req.path === "/workspaces" && req.method === "GET" || req.path === "/account" || req.path.startsWith("/account/") || req.path.startsWith("/domains")) return next();
+  if (req.path.startsWith("/public/") || req.path.startsWith("/subscribe/") || req.path.startsWith("/subscribe-widget/") || req.path === "/webhooks/resend" || req.path === "/integrations/cloudflare/callback" || req.path === "/workspaces" && req.method === "GET" || req.path === "/account" || req.path.startsWith("/account/")) return next();
   return requireUser(req, res, () => requireVerifiedOrganizationDomain(req, res, next));
 });
 app.use(campaignRouter);
 app.use(teamRouter);
-app.use((req, res, next) => {
-  res.setHeader("X-Content-Type-Options", "nosniff");
-  res.setHeader("X-Frame-Options", "DENY");
-  res.setHeader("Referrer-Policy", "no-referrer");
-  res.setHeader("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'; base-uri 'none'");
-  res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
-  res.setHeader("Cache-Control", "no-store");
-  if(process.env.NODE_ENV==="production") res.setHeader("Strict-Transport-Security", "max-age=31536000");
-  next();
-});
 
 async function requireUser(req: AuthedRequest, res: Response, next: NextFunction) {
   try {
@@ -252,6 +287,12 @@ async function requireVerifiedOrganizationDomain(req: AuthedRequest, res: Respon
       .innerJoin(workspaceMembers, eq(workspaceMembers.workspaceId, workspaces.id))
       .where(and(eq(workspaces.id, workspaceId), eq(workspaceMembers.userId, req.userId!))).limit(1);
     if (!access) return fail(res, 404, "WORKSPACE_NOT_FOUND", "The workspace could not be found.");
+    if (access.type === "personal") {
+      const [teamAccess] = await db.select({ id: workspaces.id }).from(workspaces)
+        .innerJoin(workspaceMembers, eq(workspaceMembers.workspaceId, workspaces.id))
+        .where(and(eq(workspaceMembers.userId, req.userId!), eq(workspaces.type, "organization"))).limit(1);
+      if (!teamAccess) return fail(res, 403, "TEAM_MEMBERSHIP_REQUIRED", "Join an organization team before accessing workspace features.");
+    }
     if (access.type === "organization") {
       const [verified] = await db.select({ id: domains.id }).from(domains)
         .where(and(eq(domains.workspaceId, workspaceId), eq(domains.verificationStatus, "verified"))).limit(1);
@@ -260,6 +301,58 @@ async function requireVerifiedOrganizationDomain(req: AuthedRequest, res: Respon
     return next();
   } catch (error) { return next(error); }
 }
+
+app.get("/v1/events/inbox", requireUser, async (req: AuthedRequest, res, next) => {
+  const workspaceId = String(req.query.workspaceId ?? "");
+  if (!workspaceId) return fail(res, 400, "WORKSPACE_REQUIRED", "Select a workspace.");
+  let listener: import("pg").PoolClient | null = null;
+  let heartbeat: ReturnType<typeof setInterval> | null = null;
+  const close = () => {
+    if (heartbeat) clearInterval(heartbeat);
+    if (listener) {
+      const client = listener;
+      listener = null;
+      client.removeAllListeners("notification");
+      void client.query("UNLISTEN widesip_updates").catch(() => {}).finally(() => client.release());
+    }
+  };
+  try {
+    const [membership] = await db.select({ role: workspaceMembers.role }).from(workspaceMembers)
+      .where(and(eq(workspaceMembers.workspaceId, workspaceId), eq(workspaceMembers.userId, req.userId!))).limit(1);
+    if (!membership) return fail(res, 404, "WORKSPACE_NOT_FOUND", "The workspace could not be found.");
+    const allowedMailboxIds = membership.role === "member"
+      ? (await db.select({ mailboxId: mailboxAccess.mailboxId }).from(mailboxAccess)
+          .where(and(eq(mailboxAccess.workspaceId, workspaceId), eq(mailboxAccess.userId, req.userId!)))).map(row => row.mailboxId)
+      : null;
+    res.status(200).set({ "Content-Type": "text/event-stream", "Cache-Control": "no-cache, no-transform", Connection: "keep-alive", "X-Accel-Buffering": "no" });
+    res.flushHeaders();
+    res.on("close", close);
+    res.on("error", close);
+    listener = await eventStreamPool.connect();
+    if (res.destroyed) { close(); return; }
+    await listener.query("LISTEN widesip_updates");
+    if (res.destroyed) { close(); return; }
+    listener.on("notification", notification => {
+      if (notification.channel !== "widesip_updates" || !notification.payload) return;
+      try {
+        const event = JSON.parse(notification.payload) as { workspaceId?: string; mailboxId?: string; type?: string };
+        if (event.workspaceId !== workspaceId || !event.mailboxId) return;
+        if (allowedMailboxIds && !allowedMailboxIds.includes(event.mailboxId)) return;
+        const eventName = event.type === "campaign" ? "campaign-update" : "inbox-update";
+        res.write(`event: ${eventName}\ndata: ${JSON.stringify({ mailboxId: event.mailboxId })}\n\n`);
+      } catch { /* Ignore malformed database notification payloads. */ }
+    });
+    heartbeat = setInterval(() => res.write(": keep-alive\n\n"), 25_000);
+    // A request's `close` event can fire once the request body is consumed,
+    // even though its streaming response is still open. Tie cleanup to the
+    // response socket instead so the listener survives until the client leaves.
+    res.write(`event: ready\ndata: ${JSON.stringify({ workspaceId })}\n\n`);
+  } catch (error) {
+    close();
+    if (!res.headersSent) return next(error);
+    res.end();
+  }
+});
 
 function makeDnsVerification(domainName: string, tokenHash: string, expiresAt: Date, verifiedAt: Date | null) {
   return {
@@ -284,9 +377,9 @@ function isExpectedDnsMiss(error: unknown) {
 
 type CloudflareDnsRecord = { id: string; type: string; name: string; content: string; priority?: number };
 
-async function cloudflareRequest<T>(path: string, init: RequestInit = {}): Promise<T> {
-  const token = process.env.CLOUDFLARE_API_TOKEN;
-  if (!token) throw new Error("Cloudflare automatic DNS setup is not configured. Add CLOUDFLARE_API_TOKEN and CLOUDFLARE_ZONE_ID to .env.");
+async function cloudflareRequest<T>(path: string, init: RequestInit = {}, authorizedToken?: string): Promise<T> {
+  const token = authorizedToken ?? (process.env.NODE_ENV !== "production" ? process.env.CLOUDFLARE_API_TOKEN : undefined);
+  if (!token) throw new Error("Connect this organization's Cloudflare account to automate DNS, or add the displayed DNS records manually.");
   const response = await fetch(`https://api.cloudflare.com/client/v4${path}`, {
     ...init,
     headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json", ...(init.headers ?? {}) },
@@ -295,6 +388,165 @@ async function cloudflareRequest<T>(path: string, init: RequestInit = {}): Promi
   if (!response.ok || !payload.success) throw new Error(payload.errors?.[0]?.message ?? `Cloudflare returned HTTP ${response.status}.`);
   return payload.result as T;
 }
+
+function cloudflareEncryptionKey() {
+  const encoded = process.env.CLOUDFLARE_TOKEN_ENCRYPTION_KEY;
+  if (!encoded) throw new Error("Cloudflare token encryption is not configured.");
+  const key = Buffer.from(encoded, "base64");
+  if (key.length !== 32) throw new Error("CLOUDFLARE_TOKEN_ENCRYPTION_KEY must be base64 for exactly 32 random bytes.");
+  return key;
+}
+function encryptCloudflareSecret(value: string) {
+  const iv = randomBytes(12);
+  const cipher = createCipheriv("aes-256-gcm", cloudflareEncryptionKey(), iv);
+  const ciphertext = Buffer.concat([cipher.update(value, "utf8"), cipher.final()]);
+  return `v1.${iv.toString("base64url")}.${cipher.getAuthTag().toString("base64url")}.${ciphertext.toString("base64url")}`;
+}
+function decryptCloudflareSecret(value: string) {
+  const [version, iv, tag, ciphertext] = value.split(".");
+  if (version !== "v1" || !iv || !tag || !ciphertext) throw new Error("Stored Cloudflare credential has an unsupported format.");
+  const decipher = createDecipheriv("aes-256-gcm", cloudflareEncryptionKey(), Buffer.from(iv, "base64url"));
+  decipher.setAuthTag(Buffer.from(tag, "base64url"));
+  return Buffer.concat([decipher.update(Buffer.from(ciphertext, "base64url")), decipher.final()]).toString("utf8");
+}
+function cloudflareOAuthConfig() {
+  const { CLOUDFLARE_OAUTH_CLIENT_ID: clientId, CLOUDFLARE_OAUTH_CLIENT_SECRET: clientSecret, CLOUDFLARE_OAUTH_REDIRECT_URI: redirectUri } = process.env;
+  const scopes = (process.env.CLOUDFLARE_OAUTH_SCOPES ?? "").trim();
+  if (!clientId || !clientSecret || !redirectUri || !scopes) return null;
+  const encodedKey = process.env.CLOUDFLARE_TOKEN_ENCRYPTION_KEY;
+  if (!encodedKey || Buffer.from(encodedKey, "base64").length !== 32) return null;
+  const callback = new URL(redirectUri);
+  if (process.env.NODE_ENV === "production" && callback.protocol !== "https:") throw new Error("Cloudflare OAuth redirect URI must use HTTPS in production.");
+  return { clientId, clientSecret, redirectUri: callback.toString(), scopes };
+}
+async function cloudflareOAuthApi<T>(path: string, accessToken: string, init: RequestInit = {}): Promise<T> {
+  const response = await fetch(`https://api.cloudflare.com/client/v4${path}`, {
+    ...init,
+    headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json", ...(init.headers ?? {}) },
+  });
+  const payload = await response.json().catch(() => ({})) as { success?: boolean; errors?: Array<{ message?: string }>; result?: T };
+  if (!response.ok || payload.success === false) throw new Error(payload.errors?.[0]?.message ?? `Cloudflare returned HTTP ${response.status}.`);
+  return payload.result as T;
+}
+async function freshCloudflareAccessToken(domainId: string) {
+  // Serialize refreshes across API replicas to prevent two requests consuming
+  // a rotating refresh token at the same time.
+  return db.transaction(async tx => {
+    await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`cloudflare:${domainId}`}))`);
+    const [connection] = await tx.select().from(cloudflareConnections).where(eq(cloudflareConnections.domainId, domainId)).limit(1);
+    if (!connection) return null;
+    if (connection.accessTokenExpiresAt.getTime() > Date.now() + 60_000) return decryptCloudflareSecret(connection.accessTokenEncrypted);
+    const config = cloudflareOAuthConfig();
+    if (!config) throw new Error("Cloudflare OAuth is not configured.");
+    const body = new URLSearchParams({ grant_type: "refresh_token", refresh_token: decryptCloudflareSecret(connection.refreshTokenEncrypted) });
+    const response = await fetch("https://dash.cloudflare.com/oauth2/token", {
+      method: "POST",
+      headers: { Authorization: `Basic ${Buffer.from(`${config.clientId}:${config.clientSecret}`).toString("base64")}`, "Content-Type": "application/x-www-form-urlencoded" },
+      body,
+    });
+    const token = await response.json().catch(() => ({})) as { access_token?: string; refresh_token?: string; expires_in?: number; scope?: string; error_description?: string };
+    if (!response.ok || !token.access_token || !token.refresh_token) throw new Error(token.error_description ?? "Cloudflare authorization expired. Reconnect Cloudflare to continue.");
+    await tx.update(cloudflareConnections).set({
+      accessTokenEncrypted: encryptCloudflareSecret(token.access_token), refreshTokenEncrypted: encryptCloudflareSecret(token.refresh_token),
+      accessTokenExpiresAt: new Date(Date.now() + Math.max(60, token.expires_in ?? 3600) * 1000), scopes: token.scope ?? connection.scopes, updatedAt: new Date(),
+    }).where(eq(cloudflareConnections.id, connection.id));
+    return token.access_token;
+  });
+}
+
+app.post("/v1/domains/:domainId/cloudflare/connect", requireUser, async (req: AuthedRequest, res, next) => {
+  try {
+    const config = cloudflareOAuthConfig();
+    if (!config) return fail(res, 503, "CLOUDFLARE_OAUTH_NOT_CONFIGURED", "Cloudflare connection is not configured yet. DNS records are still available for manual setup.");
+    const [domain] = await db.select({ id: domains.id, workspaceId: domains.workspaceId, domainName: domains.domainName, verificationStatus: domains.verificationStatus, role: workspaceMembers.role, workspaceType: workspaces.type })
+      .from(domains).innerJoin(workspaceMembers, eq(workspaceMembers.workspaceId, domains.workspaceId)).innerJoin(workspaces, eq(workspaces.id, domains.workspaceId))
+      .where(and(eq(domains.id, String(req.params.domainId)), eq(workspaceMembers.userId, req.userId!))).limit(1);
+    if (!domain) return fail(res, 404, "DOMAIN_NOT_FOUND", "The domain could not be found.");
+    if (domain.workspaceType !== "organization") return fail(res, 403, "ORGANIZATION_REQUIRED", "Cloudflare automation is available for organization domains.");
+    if (!["owner", "admin"].includes(domain.role)) return fail(res, 403, "FORBIDDEN", "Only an organization owner or admin can connect Cloudflare.");
+    if (domain.verificationStatus !== "verified") return fail(res, 409, "DOMAIN_NOT_VERIFIED", "Verify this domain before connecting Cloudflare.");
+    const state = randomBytes(32).toString("base64url");
+    const verifier = randomBytes(32).toString("base64url");
+    const challenge = createHash("sha256").update(verifier).digest("base64url");
+    await db.delete(cloudflareOAuthStates).where(lt(cloudflareOAuthStates.expiresAt, new Date()));
+    await db.insert(cloudflareOAuthStates).values({
+      stateHash: createHash("sha256").update(state).digest("hex"), workspaceId: domain.workspaceId, domainId: domain.id,
+      userId: req.userId!, codeVerifierEncrypted: encryptCloudflareSecret(verifier), expiresAt: new Date(Date.now() + 10 * 60_000),
+    });
+    const authorize = new URL("https://dash.cloudflare.com/oauth2/auth");
+    authorize.search = new URLSearchParams({ client_id: config.clientId, redirect_uri: config.redirectUri, response_type: "code", scope: config.scopes, state, code_challenge: challenge, code_challenge_method: "S256" }).toString();
+    return res.json({ success: true, data: { authorizationUrl: authorize.toString() } });
+  } catch (error) { next(error); }
+});
+
+app.get("/v1/domains/:domainId/cloudflare/status", requireUser, async (req: AuthedRequest, res, next) => {
+  try {
+    const [domain] = await db.select({ id: domains.id, workspaceId: domains.workspaceId, domainName: domains.domainName, cloudflareZoneId: domains.cloudflareZoneId, cloudflareZoneName: domains.cloudflareZoneName, role: workspaceMembers.role })
+      .from(domains).innerJoin(workspaceMembers, eq(workspaceMembers.workspaceId, domains.workspaceId))
+      .where(and(eq(domains.id, String(req.params.domainId)), eq(workspaceMembers.userId, req.userId!))).limit(1);
+    if (!domain) return fail(res, 404, "DOMAIN_NOT_FOUND", "The domain could not be found.");
+    const [connection] = await db.select({ updatedAt: cloudflareConnections.updatedAt }).from(cloudflareConnections).where(eq(cloudflareConnections.domainId, domain.id)).limit(1);
+    return res.json({ success: true, data: { connected: Boolean(connection && domain.cloudflareZoneId), zoneName: domain.cloudflareZoneName, connectedAt: connection?.updatedAt ?? null, canManage: ["owner", "admin"].includes(domain.role), configured: Boolean(cloudflareOAuthConfig()) } });
+  } catch (error) { next(error); }
+});
+
+app.get("/v1/integrations/cloudflare/callback", async (req, res) => {
+  const web = (process.env.WEB_ORIGIN ?? "https://widesi.online").replace(/\/$/, "");
+  const errorUrl = (code: string) => res.redirect(`${web}/app/domains?cloudflare=${encodeURIComponent(code)}`);
+  try {
+    const config = cloudflareOAuthConfig();
+    const code = typeof req.query.code === "string" ? req.query.code : "";
+    const state = typeof req.query.state === "string" ? req.query.state : "";
+    if (!config || !code || !state || req.query.error) return errorUrl("failed");
+    const session = await auth.api.getSession({ headers: fromNodeHeaders(req.headers) });
+    if (!session) return errorUrl("sign-in-required");
+    const stateHash = createHash("sha256").update(state).digest("hex");
+    const [pending] = await db.delete(cloudflareOAuthStates).where(and(eq(cloudflareOAuthStates.stateHash, stateHash), gt(cloudflareOAuthStates.expiresAt, new Date()), eq(cloudflareOAuthStates.userId, session.user.id))).returning();
+    if (!pending) return errorUrl("expired");
+    const verifier = decryptCloudflareSecret(pending.codeVerifierEncrypted);
+    const body = new URLSearchParams({ grant_type: "authorization_code", code, redirect_uri: config.redirectUri, code_verifier: verifier });
+    const tokenResponse = await fetch("https://dash.cloudflare.com/oauth2/token", {
+      method: "POST", headers: { Authorization: `Basic ${Buffer.from(`${config.clientId}:${config.clientSecret}`).toString("base64")}`, "Content-Type": "application/x-www-form-urlencoded" }, body,
+    });
+    const token = await tokenResponse.json().catch(() => ({})) as { access_token?: string; refresh_token?: string; expires_in?: number; scope?: string; error_description?: string };
+    if (!tokenResponse.ok || !token.access_token || !token.refresh_token) {
+      console.error("[cloudflare-oauth] Token exchange failed", { status: tokenResponse.status, detail: token.error_description });
+      return errorUrl("failed");
+    }
+    type Zone = { id: string; name: string; status: string };
+    const zones: Zone[] = [];
+    for (let page = 1; page <= 10; page++) {
+      const batch = await cloudflareOAuthApi<Zone[]>(`/zones?per_page=50&page=${page}`, token.access_token);
+      zones.push(...batch);
+      if (batch.length < 50) break;
+    }
+    const [domain] = await db.select({ id: domains.id, workspaceId: domains.workspaceId, domainName: domains.domainName, verificationStatus: domains.verificationStatus })
+      .from(domains).where(and(eq(domains.id, pending.domainId), eq(domains.workspaceId, pending.workspaceId))).limit(1);
+    if (!domain || domain.verificationStatus !== "verified") return errorUrl("domain-changed");
+    const callbackRole = await workspaceRole(pending.workspaceId, session.user.id);
+    if (!["owner", "admin"].includes(callbackRole ?? "")) return errorUrl("access-changed");
+    const normalized = domain.domainName.toLowerCase();
+    const zone = zones.filter(item => item.status === "active" && (normalized === item.name.toLowerCase() || normalized.endsWith(`.${item.name.toLowerCase()}`)))
+      .sort((a, b) => b.name.length - a.name.length)[0];
+    if (!zone) return errorUrl("zone-not-found");
+    const now = new Date();
+    await db.transaction(async tx => {
+      await tx.insert(cloudflareConnections).values({
+        workspaceId: pending.workspaceId, domainId: pending.domainId, connectedByUserId: session.user.id,
+        accessTokenEncrypted: encryptCloudflareSecret(token.access_token!), refreshTokenEncrypted: encryptCloudflareSecret(token.refresh_token!),
+        accessTokenExpiresAt: new Date(Date.now() + Math.max(60, token.expires_in ?? 3600) * 1000), scopes: token.scope ?? config.scopes, createdAt: now, updatedAt: now,
+      }).onConflictDoUpdate({ target: cloudflareConnections.domainId, set: {
+        connectedByUserId: session.user.id, accessTokenEncrypted: encryptCloudflareSecret(token.access_token!), refreshTokenEncrypted: encryptCloudflareSecret(token.refresh_token!),
+        accessTokenExpiresAt: new Date(Date.now() + Math.max(60, token.expires_in ?? 3600) * 1000), scopes: token.scope ?? config.scopes, updatedAt: now,
+      } });
+      await tx.update(domains).set({ cloudflareZoneId: zone.id, cloudflareZoneName: zone.name }).where(eq(domains.id, domain.id));
+    });
+    return res.redirect(`${web}/app/domains/${encodeURIComponent(domain.id)}/setup?cloudflare=connected`);
+  } catch (error) {
+    console.error("[cloudflare-oauth] Callback failed", error instanceof Error ? error.message : "unknown error");
+    return errorUrl("failed");
+  }
+});
 
 function normalizedDnsName(name: string, zone: string) {
   const trimmed = name.trim().replace(/\.$/, "");
@@ -311,6 +563,27 @@ function emailAddressFromHeader(value: string) {
 }
 
 app.get("/health", (_req, res) => res.json({ success: true, data: { status: "ok" } }));
+app.get("/ready", async (_req, res) => {
+  const missing = process.env.NODE_ENV === "production"
+    ? [
+        ["RESEND_API_KEY", Boolean(process.env.RESEND_API_KEY)],
+        ["RESEND_FROM", Boolean(process.env.RESEND_FROM && !/your[-_ ]verified[-_ ]domain|example\.com/i.test(process.env.RESEND_FROM))],
+        ["RESEND_WEBHOOK_SECRET", Boolean(process.env.RESEND_WEBHOOK_SECRET)],
+        ["WIDESIP_PUBLIC_URL", Boolean(process.env.WIDESIP_PUBLIC_URL?.startsWith("https://"))],
+        ["CAMPAIGN_UNSUBSCRIBE_SECRET", Boolean(process.env.CAMPAIGN_UNSUBSCRIBE_SECRET && process.env.CAMPAIGN_UNSUBSCRIBE_SECRET.length >= 32)],
+        ["CLOUDFLARE_OAUTH_CLIENT_ID", Boolean(process.env.CLOUDFLARE_OAUTH_CLIENT_ID)],
+        ["CLOUDFLARE_OAUTH_CLIENT_SECRET", Boolean(process.env.CLOUDFLARE_OAUTH_CLIENT_SECRET)],
+        ["CLOUDFLARE_OAUTH_REDIRECT_URI", Boolean(process.env.CLOUDFLARE_OAUTH_REDIRECT_URI?.startsWith("https://"))],
+        ["CLOUDFLARE_OAUTH_SCOPES", Boolean(process.env.CLOUDFLARE_OAUTH_SCOPES?.trim())],
+        ["CLOUDFLARE_TOKEN_ENCRYPTION_KEY", Boolean(process.env.CLOUDFLARE_TOKEN_ENCRYPTION_KEY && Buffer.from(process.env.CLOUDFLARE_TOKEN_ENCRYPTION_KEY, "base64").length === 32)],
+      ].filter(([, configured]) => !configured).map(([name]) => name)
+    : [];
+  let database = "ok";
+  try { await db.execute(sql`select 1`); }
+  catch { database = "unavailable"; }
+  const ready = database === "ok" && missing.length === 0;
+  return res.status(ready ? 200 : 503).json({ success: ready, data: { status: ready ? "ready" : "not_ready", database, missing } });
+});
 
 app.get("/v1/workspaces", requireUser, async (req: AuthedRequest, res, next) => {
   try {
@@ -556,7 +829,9 @@ app.get("/v1/workspaces/:workspaceId/subscription-link", requireUser, async (req
   try {
     const role = await workspaceRole(workspaceId, req.userId!);
     if (!role) return fail(res, 404, "WORKSPACE_NOT_FOUND", "The workspace could not be found.");
-    if (!(role === "owner" || role === "admin")) return fail(res, 403, "FORBIDDEN", "Only workspace owners and admins can manage signup links.");
+    const [workspace] = await db.select({ type: workspaces.type }).from(workspaces).where(eq(workspaces.id, workspaceId)).limit(1);
+    if (workspace?.type !== "organization") return fail(res, 403, "ORGANIZATION_REQUIRED", "Public contact collection forms are available for organization workspaces.");
+    if (!(role === "owner" || role === "admin")) return fail(res, 403, "FORBIDDEN", "Only workspace owners and admins can manage contact collection links.");
     const publicUrl = process.env.WIDESIP_PUBLIC_URL?.replace(/\/$/, "");
     if (!publicUrl || !/^https:\/\//i.test(publicUrl)) return fail(res, 503, "PUBLIC_URL_NOT_CONFIGURED", "Set WIDESIP_PUBLIC_URL to your current public HTTPS tunnel URL in the root .env.");
     let [link] = await db.select({ token: workspaceSubscriptionLinks.token, updatedAt: workspaceSubscriptionLinks.updatedAt }).from(workspaceSubscriptionLinks).where(eq(workspaceSubscriptionLinks.workspaceId, workspaceId)).limit(1);
@@ -573,7 +848,9 @@ app.post("/v1/workspaces/:workspaceId/subscription-link/regenerate", requireUser
   try {
     const role = await workspaceRole(workspaceId, req.userId!);
     if (!role) return fail(res, 404, "WORKSPACE_NOT_FOUND", "The workspace could not be found.");
-    if (!(role === "owner" || role === "admin")) return fail(res, 403, "FORBIDDEN", "Only workspace owners and admins can manage signup links.");
+    const [workspace] = await db.select({ type: workspaces.type }).from(workspaces).where(eq(workspaces.id, workspaceId)).limit(1);
+    if (workspace?.type !== "organization") return fail(res, 403, "ORGANIZATION_REQUIRED", "Public contact collection forms are available for organization workspaces.");
+    if (!(role === "owner" || role === "admin")) return fail(res, 403, "FORBIDDEN", "Only workspace owners and admins can manage contact collection links.");
     const publicUrl = process.env.WIDESIP_PUBLIC_URL?.replace(/\/$/, "");
     if (!publicUrl || !/^https:\/\//i.test(publicUrl)) return fail(res, 503, "PUBLIC_URL_NOT_CONFIGURED", "Set WIDESIP_PUBLIC_URL to your current public HTTPS tunnel URL in the root .env.");
     const token = randomBytes(32).toString("base64url");
@@ -584,43 +861,43 @@ app.post("/v1/workspaces/:workspaceId/subscription-link/regenerate", requireUser
 
 app.get("/v1/subscribe-widget/:token.js", (req, res) => {
   const token = String(req.params.token);
-  if (!/^[A-Za-z0-9_-]{40,50}$/.test(token)) return res.status(404).type("text").send("/* Invalid Widesip signup widget. */");
+  if (!/^[A-Za-z0-9_-]{40,50}$/.test(token)) return res.status(404).type("text").send("/* Invalid Widesip contact collection widget. */");
   const source = `(()=>{const script=document.currentScript;if(!script)return;const token=${JSON.stringify(token)};const origin=new URL(script.src).origin;const label=script.dataset.label||"Subscribe";const button=document.createElement("button");button.type="button";button.textContent=label;button.setAttribute("aria-haspopup","dialog");button.style.cssText="appearance:none;border:0;border-radius:9px;padding:12px 18px;background:#356ae6;color:#fff;font:600 14px Arial,Helvetica,sans-serif;cursor:pointer;box-shadow:0 5px 14px #356ae633";const parent=script.parentNode;if(parent)parent.insertBefore(button,script);let overlay=null,frame=null,subscribed=false;function close(){if(overlay){overlay.remove();overlay=null;frame=null}document.removeEventListener("keydown",onKey)}function onKey(event){if(event.key==="Escape")close()}button.addEventListener("click",()=>{if(subscribed||overlay)return;overlay=document.createElement("div");overlay.setAttribute("role","dialog");overlay.setAttribute("aria-modal","true");overlay.setAttribute("aria-label","Newsletter signup");overlay.style.cssText="position:fixed;inset:0;z-index:2147483000;display:grid;place-items:center;padding:16px;background:rgba(15,27,47,.58);backdrop-filter:blur(3px)";const panel=document.createElement("div");panel.style.cssText="position:relative;width:min(100%,520px);max-height:calc(100vh - 32px);overflow:auto;border-radius:18px;background:#fff;box-shadow:0 25px 90px rgba(10,20,40,.28)";const closeButton=document.createElement("button");closeButton.type="button";closeButton.textContent="×";closeButton.setAttribute("aria-label","Close signup");closeButton.style.cssText="position:absolute;top:10px;right:12px;z-index:1;width:36px;height:36px;border:0;border-radius:50%;background:#f1f4f8;color:#34445e;font:26px Arial,sans-serif;cursor:pointer";frame=document.createElement("iframe");frame.title="Newsletter signup form";frame.src=origin+"/v1/subscribe/"+token+"?embed=1";frame.referrerPolicy="strict-origin-when-cross-origin";frame.style.cssText="display:block;width:100%;height:min(620px,calc(100vh - 32px));border:0";closeButton.addEventListener("click",close);overlay.addEventListener("click",event=>{if(event.target===overlay)close()});panel.append(closeButton,frame);overlay.append(panel);document.body.append(overlay);document.addEventListener("keydown",onKey);closeButton.focus()});window.addEventListener("message",event=>{if(event.origin===origin&&frame&&event.source===frame.contentWindow&&event.data&&event.data.type==="widesip:subscription-complete"){subscribed=true;button.textContent="Subscribed"}})})();`;
   return res.type("application/javascript").set("Cache-Control", "no-store").send(source);
 });
 
 app.get("/v1/subscribe/:token", async (req, res) => {
   const token = String(req.params.token);
-  if (!/^[A-Za-z0-9_-]{40,50}$/.test(token)) return res.status(404).type("html").send(subscriptionPage("", "error", "This signup link is invalid."));
+  if (!/^[A-Za-z0-9_-]{40,50}$/.test(token)) return res.status(404).type("html").send(subscriptionPage("", "error", "This signup link is invalid.", "Widesip", false, res.locals.cspNonce));
   const [link] = await db.select({ workspaceId: workspaceSubscriptionLinks.workspaceId, workspaceName: workspaces.name }).from(workspaceSubscriptionLinks).innerJoin(workspaces, eq(workspaces.id, workspaceSubscriptionLinks.workspaceId)).where(eq(workspaceSubscriptionLinks.token, token)).limit(1);
-  if (!link) return res.status(404).type("html").send(subscriptionPage("", "error", "This signup link is no longer active."));
-  return res.type("html").send(subscriptionPage(token, "form", "", link.workspaceName, req.query.embed === "1"));
+  if (!link) return res.status(404).type("html").send(subscriptionPage("", "error", "This signup link is no longer active.", "Widesip", false, res.locals.cspNonce));
+  return res.type("html").send(subscriptionPage(token, "form", "", link.workspaceName, req.query.embed === "1", res.locals.cspNonce));
 });
 
 app.post("/v1/subscribe/:token", express.urlencoded({ extended: false, limit: "20kb" }), async (req, res) => {
   const token = String(req.params.token);
   const [link] = await db.select({ workspaceId: workspaceSubscriptionLinks.workspaceId, workspaceName: workspaces.name }).from(workspaceSubscriptionLinks).innerJoin(workspaces, eq(workspaces.id, workspaceSubscriptionLinks.workspaceId)).where(eq(workspaceSubscriptionLinks.token, token)).limit(1);
-  if (!link) return res.status(404).type("html").send(subscriptionPage("", "error", "This signup link is no longer active."));
+  if (!link) return res.status(404).type("html").send(subscriptionPage("", "error", "This signup link is no longer active.", "Widesip", false, res.locals.cspNonce));
   const ip = req.header("cf-connecting-ip")?.trim() || req.ip || "unknown";
-  const recent = (publicSubscribeAttempts.get(ip) ?? []).filter(time => Date.now() - time < 60_000);
   const embedded = req.query.embed === "1";
-  if (recent.length >= 8) return res.status(429).type("html").send(subscriptionPage(token, "error", "Please wait a minute before trying again.", link.workspaceName, embedded));
-  publicSubscribeAttempts.set(ip, [...recent, Date.now()]);
-  if (String(req.body?.website_url ?? "").trim()) return res.type("html").send(subscriptionPage(token, "success", "", link.workspaceName, embedded));
+  if (!await consumeRateLimit(rateLimitFingerprint("public-signup", `${ip}|${token}`), 8, 60_000)) {
+    return res.status(429).type("html").send(subscriptionPage(token, "error", "Please wait a minute before trying again.", link.workspaceName, embedded, res.locals.cspNonce));
+  }
+  if (String(req.body?.website_url ?? "").trim()) return res.type("html").send(subscriptionPage(token, "success", "", link.workspaceName, embedded, res.locals.cspNonce));
   const email = typeof req.body?.email === "string" ? req.body.email.trim().toLowerCase() : "";
   const firstName = typeof req.body?.firstName === "string" ? req.body.firstName.trim().slice(0, 100) : "";
   const lastName = typeof req.body?.lastName === "string" ? req.body.lastName.trim().slice(0, 100) : "";
   if (!firstName || req.body?.consent !== "yes" || email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-    return res.status(400).type("html").send(subscriptionPage(token, "error", "Enter your first name and a valid email address, then confirm your agreement to receive newsletter emails.", link.workspaceName, embedded));
+    return res.status(400).type("html").send(subscriptionPage(token, "error", "Enter your first name and a valid email address, then confirm your agreement to receive newsletter emails.", link.workspaceName, embedded, res.locals.cspNonce));
   }
   try {
     const now = new Date();
     await db.insert(contacts).values({ workspaceId: link.workspaceId, email, firstName: firstName || null, lastName: lastName || null, consentStatus: "subscribed", consentSource: "public_signup", consentAt: now })
       .onConflictDoUpdate({ target: [contacts.workspaceId, contacts.email], set: { firstName: firstName || null, lastName: lastName || null, consentStatus: "subscribed", consentSource: "public_signup", consentAt: now, unsubscribedAt: null, updatedAt: now } });
-    return res.type("html").send(subscriptionPage(token, "success", "", link.workspaceName, embedded));
+    return res.type("html").send(subscriptionPage(token, "success", "", link.workspaceName, embedded, res.locals.cspNonce));
   } catch (error) {
     console.error("Public newsletter signup failed:", error instanceof Error ? error.message : "unknown error");
-    return res.status(500).type("html").send(subscriptionPage(token, "error", "We couldn’t save your subscription just now. Please try again.", link.workspaceName, embedded));
+    return res.status(500).type("html").send(subscriptionPage(token, "error", "We couldn’t save your subscription just now. Please try again.", link.workspaceName, embedded, res.locals.cspNonce));
   }
 });
 
@@ -914,7 +1191,7 @@ app.post("/v1/domains/:domainId/mail-setup", requireUser, async (req: AuthedRequ
       id: domains.id, workspaceId: domains.workspaceId, domainName: domains.domainName,
       verificationStatus: domains.verificationStatus, sendingProvider: domains.sendingProvider,
       sendingProviderDomainId: domains.sendingProviderDomainId, resendDomainId: domains.resendDomainId,
-      receivingEnabled: domains.receivingEnabled,
+      receivingEnabled: domains.receivingEnabled, cloudflareZoneId: domains.cloudflareZoneId,
       role: workspaceMembers.role,
     }).from(domains).innerJoin(workspaceMembers, eq(workspaceMembers.workspaceId, domains.workspaceId))
       .where(and(eq(domains.id, String(req.params.domainId)), eq(workspaceMembers.userId, req.userId!))).limit(1);
@@ -939,8 +1216,11 @@ app.post("/v1/domains/:domainId/mail-setup", requireUser, async (req: AuthedRequ
     }
     if (!receivingSpecified && providerDomain.capabilities?.receiving === "enabled") receivingEnabled = true;
 
-    const zoneId = process.env.CLOUDFLARE_ZONE_ID;
-    const canWriteDns = Boolean(process.env.CLOUDFLARE_API_TOKEN && zoneId);
+    const zoneId = process.env.NODE_ENV === "production" ? domain.cloudflareZoneId : process.env.CLOUDFLARE_ZONE_ID;
+    const oauthToken = process.env.NODE_ENV === "production" ? await freshCloudflareAccessToken(domain.id) : null;
+    // Production writes are authorized by this workspace's OAuth grant and
+    // the zone selected from the Cloudflare account that granted it.
+    const canWriteDns = Boolean(zoneId && (oauthToken || (process.env.NODE_ENV !== "production" && process.env.CLOUDFLARE_API_TOKEN)));
     const dnsRecords = [...(providerDomain.records ?? [])].sort((left, right) => {
       const leftRootMx = left.type.toUpperCase() === "MX" && normalizedDnsName(left.name, domain.domainName) === domain.domainName;
       const rightRootMx = right.type.toUpperCase() === "MX" && normalizedDnsName(right.name, domain.domainName) === domain.domainName;
@@ -951,7 +1231,7 @@ app.post("/v1/domains/:domainId/mail-setup", requireUser, async (req: AuthedRequ
       for (const record of dnsRecords) {
         const type = record.type.toUpperCase();
         const name = normalizedDnsName(record.name, domain.domainName);
-        const current = await cloudflareRequest<CloudflareDnsRecord[]>(`/zones/${encodeURIComponent(zoneId!)}/dns_records?type=${encodeURIComponent(type)}&name=${encodeURIComponent(name)}`);
+        const current = await cloudflareRequest<CloudflareDnsRecord[]>(`/zones/${encodeURIComponent(zoneId!)}/dns_records?type=${encodeURIComponent(type)}&name=${encodeURIComponent(name)}`, {}, oauthToken ?? undefined);
         const wantedValue = comparableDnsValue(record.value);
         const existingMatch = current.find((item) => comparableDnsValue(item.content) === wantedValue && (type !== "MX" || item.priority === (record.priority ?? 10)));
         if (existingMatch) { applied.push(`${type} ${name}`); continue; }
@@ -971,7 +1251,7 @@ app.post("/v1/domains/:domainId/mail-setup", requireUser, async (req: AuthedRequ
         await cloudflareRequest<CloudflareDnsRecord>(`/zones/${encodeURIComponent(zoneId!)}/dns_records`, {
           method: "POST",
           body: JSON.stringify({ type, name, content: record.value, ttl, proxied: false, ...(type === "MX" ? { priority: record.priority ?? 10 } : {}) }),
-        });
+        }, oauthToken ?? undefined);
         applied.push(`${type} ${name}`);
       }
       await provider.verifyDomain(providerDomain.id);
@@ -984,7 +1264,6 @@ app.post("/v1/domains/:domainId/mail-setup", requireUser, async (req: AuthedRequ
       status: providerDomain.status,
       receivingEnabled,
       receivingStatus: providerDomain.capabilities?.receiving ?? (receivingEnabled ? "enabled" : "disabled"),
-      receiveWebhookUrl: receivingEnabled && process.env.WIDESIP_PUBLIC_URL?.startsWith("https://") ? `${process.env.WIDESIP_PUBLIC_URL.replace(/\/$/, "")}/v1/webhooks/resend` : null,
       domainId: providerDomain.id,
       dnsAutomated: canWriteDns,
       appliedRecords: applied,
@@ -1264,9 +1543,6 @@ app.post("/v1/mailboxes/:mailboxId/messages", requireUser, async (req: AuthedReq
     if (mailbox.role === "member" && !(await memberCanUseMailbox(mailbox.id, mailbox.workspaceId, req.userId!))) return fail(res, 404, "MAILBOX_NOT_FOUND", "The mailbox could not be found.");
     if (mailbox.mailStatus !== "active") return fail(res, 409, "SENDING_NOT_READY", "Set up and verify sending for this domain first.");
 
-    const recent = (composeSendAttempts.get(req.userId!) ?? []).filter((time) => Date.now() - time < 60_000);
-    if (recent.length >= 10) return fail(res, 429, "SEND_LIMIT", "You can send up to ten messages per minute during this test period.");
-
     let recipient = parsed.data.recipient ?? "";
     let subject = parsed.data.subject ?? "";
     let replyMessage: { id: string; rfcMessageId: string | null; subject: string; fromAddress: string } | undefined;
@@ -1280,6 +1556,9 @@ app.post("/v1/mailboxes/:mailboxId/messages", requireUser, async (req: AuthedReq
       subject = /^re:/i.test(replyMessage.subject) ? replyMessage.subject : `Re: ${replyMessage.subject}`;
     }
     if (!recipient) return fail(res, 400, "INVALID_RECIPIENT", "Enter a valid recipient email address.");
+    if (!await consumeRateLimit(rateLimitFingerprint("compose-send", req.userId!), 10, 60_000)) {
+      return fail(res, 429, "SEND_LIMIT", "You can send up to ten messages per minute during this test period.");
+    }
 
     const from = `${mailbox.displayName.replace(/[\r\n<>\"]/g, "").trim() || "Widesip"} <${mailbox.localPart}@${mailbox.domainName}>`;
     const publicUrl = process.env.WIDESIP_PUBLIC_URL?.replace(/\/$/, "");
@@ -1303,7 +1582,6 @@ app.post("/v1/mailboxes/:mailboxId/messages", requireUser, async (req: AuthedReq
       ...(attachments.length ? { attachments: attachments.map(file => ({ filename: file.filename, content: file.content, content_type: file.contentType })) } : {}),
       ...(Object.keys(headers).length ? { headers } : {}),
     });
-    composeSendAttempts.set(req.userId!, [...recent, Date.now()]);
     const [saved] = await db.insert(messages).values({
       workspaceId: mailbox.workspaceId, mailboxId: mailbox.id, direction: "outbound",
       provider: getMailProvider().id, providerMessageId: result.id,
@@ -1395,9 +1673,9 @@ app.post("/v1/mailboxes/:mailboxId/send-test", requireUser, async (req: AuthedRe
     if (!mailbox) return fail(res, 404, "MAILBOX_NOT_FOUND", "The mailbox could not be found.");
     if (!["owner", "admin"].includes(mailbox.role)) return fail(res, 403, "FORBIDDEN", "Only workspace owners and admins can send a test message.");
     if (mailbox.mailStatus !== "active") return fail(res, 409, "SENDING_NOT_READY", "Finish and verify sending setup for this domain first.");
-    const recent = (testSendAttempts.get(req.userId!) ?? []).filter((time) => Date.now() - time < 60_000);
-    if (recent.length >= 3) return fail(res, 429, "TEST_LIMIT", "You can send up to three test messages per minute.");
-    testSendAttempts.set(req.userId!, [...recent, Date.now()]);
+    if (!await consumeRateLimit(rateLimitFingerprint("test-send", req.userId!), 3, 60_000)) {
+      return fail(res, 429, "TEST_LIMIT", "You can send up to three test messages per minute.");
+    }
     const address = `${mailbox.localPart}@${mailbox.domainName}`;
     const senderName = mailbox.displayName.replace(/[\r\n<>\"]/g, "").trim() || "Widesip";
     const result = await getMailProvider().send({

@@ -111,13 +111,16 @@ export default function InboxPage() {
     return () => { cancelled = true; window.clearTimeout(timer); };
   }, [workspaceId, mailboxId, search, loadMessages]);
 
-  // Keep the inbox current while it is open. Polling uses the normal authenticated
-  // API and skips background tabs to avoid needless requests during local testing.
+  // Postgres notifications fan message changes across API replicas. Keep a
+  // slower authenticated refresh as recovery when an event stream disconnects.
   useEffect(() => {
     if (!workspaceId) return;
     let cancelled = false;
+    let updating = false;
+    let recoveryTimer: number | undefined;
     const update = () => {
-      if (document.visibilityState !== "visible") return;
+      if (cancelled || updating || document.visibilityState !== "visible") return;
+      updating = true;
       const params = new URLSearchParams({ workspaceId });
       if (mailboxId) params.set("mailboxId", mailboxId);
       if (search.trim()) params.set("search", search.trim());
@@ -134,12 +137,30 @@ export default function InboxPage() {
         if (contactResponse.ok) { const result = await contactResponse.json() as Result<Contact[]>; if (!cancelled) setContacts(result.data ?? []); }
       }).catch(cause => {
         if (!cancelled) setError(cause instanceof Error ? cause.message : "Could not update your inbox.");
-      });
+      }).finally(() => { updating = false; });
     };
-    const timer = window.setInterval(update, 10_000);
+    const stream = new EventSource(`${api}/v1/events/inbox?workspaceId=${encodeURIComponent(workspaceId)}`, { withCredentials: true });
+    stream.addEventListener("inbox-update", update);
+    // Refresh after the initial subscription and every automatic reconnect to
+    // cover messages created while this browser was offline.
+    stream.addEventListener("ready", update);
+    stream.onopen = () => {
+      if (recoveryTimer !== undefined) window.clearInterval(recoveryTimer);
+      recoveryTimer = undefined;
+    };
+    stream.onerror = () => {
+      if (recoveryTimer === undefined) recoveryTimer = window.setInterval(update, 60_000);
+    };
     window.addEventListener("focus", update);
-    return () => { cancelled = true; window.clearInterval(timer); window.removeEventListener("focus", update); };
-  }, [workspaceId, mailboxId, search, loadMessages]);
+    document.addEventListener("visibilitychange", update);
+    return () => {
+      cancelled = true;
+      stream.close();
+      if (recoveryTimer !== undefined) window.clearInterval(recoveryTimer);
+      window.removeEventListener("focus", update);
+      document.removeEventListener("visibilitychange", update);
+    };
+  }, [workspaceId, mailboxId, search]);
 
   function viewMessages(view: InboxView) {
     if (view === "archived") return messages.filter(message => message.isArchived);

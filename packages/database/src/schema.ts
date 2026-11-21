@@ -91,6 +91,7 @@ export const domains = pgTable("domains", {
   domainName: text("domain_name").notNull(), verificationStatus: text("verification_status",{enum:["pending","verified","failed"]}).notNull().default("pending"),
   mailStatus: text("mail_status",{enum:["not_configured","pending","active","conflict"]}).notNull().default("not_configured"),
   receivingEnabled: boolean("receiving_enabled").notNull().default(false),
+  cloudflareZoneId: text("cloudflare_zone_id"), cloudflareZoneName: text("cloudflare_zone_name"),
   // Provider-neutral references let Widesip change delivery vendors without
   // changing a customer's domain or mailbox records.
   sendingProvider: text("sending_provider"),
@@ -101,7 +102,7 @@ export const domains = pgTable("domains", {
 },t=>[uniqueIndex("domains_workspace_name_unique").on(t.workspaceId,t.domainName),index("domains_workspace_created_idx").on(t.workspaceId,t.createdAt)]);
 export const domainEmailTemplates = pgTable("domain_email_templates", {
   id: uuid("id").defaultRandom().primaryKey(),
-  domainId: uuid("domain_id").notNull().unique().references(() => domains.id, { onDelete: "cascade" }),
+  domainId: uuid("domain_id").notNull().references(() => domains.id, { onDelete: "cascade" }),
   brandName: text("brand_name").notNull().default(""),
   logoUrl: text("logo_url"),
   logoImageData: text("logo_image_data"),
@@ -115,6 +116,31 @@ export const domainVerifications = pgTable("domain_verifications", {
   domainId: uuid("domain_id").notNull().references(()=>domains.id,{onDelete:"cascade"}), tokenHash: text("token_hash").notNull(),
   expiresAt: timestamp("expires_at").notNull(), verifiedAt: timestamp("verified_at"), createdAt: timestamp("created_at").notNull().defaultNow(),
 },t=>[uniqueIndex("domain_verifications_domain_unique").on(t.domainId),index("domain_verifications_workspace_idx").on(t.workspaceId)]);
+
+// OAuth grants are isolated per verified domain, so organizations can keep
+// domains in different Cloudflare accounts without token crossover.
+export const cloudflareConnections = pgTable("cloudflare_connections", {
+  id: uuid("id").defaultRandom().primaryKey(),
+  workspaceId: uuid("workspace_id").notNull().references(() => workspaces.id, { onDelete: "cascade" }),
+  domainId: uuid("domain_id").notNull().references(() => domains.id, { onDelete: "cascade" }),
+  connectedByUserId: text("connected_by_user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  accessTokenEncrypted: text("access_token_encrypted").notNull(),
+  refreshTokenEncrypted: text("refresh_token_encrypted").notNull(),
+  accessTokenExpiresAt: timestamp("access_token_expires_at").notNull(),
+  scopes: text("scopes").notNull(),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+  updatedAt: timestamp("updated_at").notNull().defaultNow(),
+}, t => [uniqueIndex("cloudflare_connections_domain_unique").on(t.domainId), index("cloudflare_connections_workspace_idx").on(t.workspaceId)]);
+
+export const cloudflareOAuthStates = pgTable("cloudflare_oauth_states", {
+  stateHash: text("state_hash").primaryKey(),
+  workspaceId: uuid("workspace_id").notNull().references(() => workspaces.id, { onDelete: "cascade" }),
+  domainId: uuid("domain_id").notNull().references(() => domains.id, { onDelete: "cascade" }),
+  userId: text("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  codeVerifierEncrypted: text("code_verifier_encrypted").notNull(),
+  expiresAt: timestamp("expires_at").notNull(),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+}, t => [index("cloudflare_oauth_states_expiry_idx").on(t.expiresAt)]);
 
 // Addresses are stored separately from delivery configuration. A mailbox is only
 // marked active after DNS/provider setup has actually been completed.
@@ -171,7 +197,10 @@ export const campaignRecipients = pgTable("campaign_recipients", {
   recipientName: text("recipient_name"),
   consentSource: text("consent_source"),
   consentAt: timestamp("consent_at"),
-  status: text("status", { enum: ["queued", "scheduled", "sent", "delivered", "delivery_delayed", "bounced", "complained", "suppressed", "unsubscribed", "failed", "canceled"] }).notNull().default("queued"),
+  status: text("status", { enum: ["queued", "processing", "scheduled", "sent", "delivered", "delivery_delayed", "bounced", "complained", "suppressed", "unsubscribed", "failed", "canceled"] }).notNull().default("queued"),
+  attempts: integer("attempts").notNull().default(0),
+  availableAt: timestamp("available_at").notNull().defaultNow(),
+  claimedAt: timestamp("claimed_at"),
   providerMessageId: text("provider_message_id"),
   error: text("error"),
   sentAt: timestamp("sent_at"),
@@ -183,6 +212,7 @@ export const campaignRecipients = pgTable("campaign_recipients", {
 }, t => [
   uniqueIndex("campaign_recipients_campaign_contact_unique").on(t.campaignId, t.contactId),
   index("campaign_recipients_campaign_status_idx").on(t.campaignId, t.status),
+  index("campaign_recipients_queue_idx").on(t.status, t.availableAt, t.createdAt),
   index("campaign_recipients_provider_message_idx").on(t.providerMessageId),
 ]);
 export const campaignTemplates = pgTable("campaign_templates", {

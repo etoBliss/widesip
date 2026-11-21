@@ -8,6 +8,34 @@
       "when": 1795252640850,
       "tag": "0000_magical_amazoness",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1795275770000,
+      "tag": "0001_cloudflare_oauth",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1795277710000,
+      "tag": "0002_campaign_queue",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1795278400000,
+      "tag": "0003_inbox_events",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1795279200000,
+      "tag": "0004_campaign_events",
+      "breakpoints": true
     }
   ]
 }
