@@ -36,6 +36,13 @@
       "when": 1795279200000,
       "tag": "0004_campaign_events",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1795280100000,
+      "tag": "0005_domain_email_custom_html",
+      "breakpoints": true
     }
   ]
 }

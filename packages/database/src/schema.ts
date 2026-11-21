@@ -109,6 +109,7 @@ export const domainEmailTemplates = pgTable("domain_email_templates", {
   logoMimeType: text("logo_mime_type"),
   accentColor: text("accent_color").notNull().default("#4165e8"),
   footerText: text("footer_text").notNull().default(""),
+  customHtml: text("custom_html").notNull().default(""),
   updatedAt: timestamp("updated_at").notNull().defaultNow(),
 });
 export const domainVerifications = pgTable("domain_verifications", {

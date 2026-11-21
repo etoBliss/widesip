@@ -7,7 +7,7 @@ import { toNodeHandler, fromNodeHeaders } from "better-auth/node";
 import { and, asc, count, desc, eq, gt, gte, ilike, inArray, like, lt, ne, or, sql } from "drizzle-orm";
 import { auth } from "./auth.js";
 import { getMailProvider, type MailDnsRecord, type ProviderDomain } from "./modules/mail/provider.js";
-import { renderBrandedMessageHtml } from "./modules/mail/campaign-template.js";
+import { renderBrandedMessageHtml, sanitizeCustomEmailHtml } from "./modules/mail/campaign-template.js";
 import { classifyInboundMessage, normalizeSenderAddress } from "./modules/mail/classification.js";
 import { validateEmailAttachments } from "./modules/mail/attachments.js";
 import { campaignRouter, handleCampaignEmailEvent } from "./modules/campaigns.js";
@@ -1029,11 +1029,13 @@ app.get("/v1/domains/:domainId/template", requireUser, async (req: AuthedRequest
     if (!access) return fail(res, 404, "DOMAIN_NOT_FOUND", "The domain could not be found.");
     if (!["owner", "admin"].includes(access.role)) return fail(res, 403, "FORBIDDEN", "Only workspace owners and admins can manage domain email templates.");
     const [saved] = await db.select().from(domainEmailTemplates).where(eq(domainEmailTemplates.domainId, access.id)).limit(1);
+    const addresses = await db.select({ localPart: mailboxes.localPart, displayName: mailboxes.displayName })
+      .from(mailboxes).where(eq(mailboxes.domainId, access.id)).orderBy(asc(mailboxes.createdAt));
     const publicUrl = process.env.WIDESIP_PUBLIC_URL?.replace(/\/$/, "");
     const logoUrl = saved?.logoImageData
       ? (publicUrl ? `${publicUrl}/v1/public/domains/${access.id}/logo` : null)
       : saved?.logoUrl ?? null;
-    return res.json({ success: true, data: { domainId: access.id, brandName: saved?.brandName ?? access.domainName, accentColor: saved?.accentColor ?? "#4165e8", footerText: saved?.footerText ?? "", logoUrl, hasUploadedLogo: Boolean(saved?.logoImageData), canUploadLogo: Boolean(publicUrl), domainName: access.domainName, verificationStatus: access.verificationStatus } });
+    return res.json({ success: true, data: { domainId: access.id, brandName: saved?.brandName ?? access.domainName, accentColor: saved?.accentColor ?? "#4165e8", footerText: saved?.footerText ?? "", customHtml: saved?.customHtml ?? "", addresses, logoUrl, hasUploadedLogo: Boolean(saved?.logoImageData), canUploadLogo: Boolean(publicUrl), domainName: access.domainName, verificationStatus: access.verificationStatus } });
   } catch (error) { next(error); }
 });
 
@@ -1041,30 +1043,36 @@ app.patch("/v1/domains/:domainId/template", requireUser, async (req: AuthedReque
   const brandName = typeof req.body?.brandName === "string" ? req.body.brandName.trim() : "";
   const accentColor = typeof req.body?.accentColor === "string" ? req.body.accentColor : "";
   const footerText = typeof req.body?.footerText === "string" ? req.body.footerText.trim() : "";
+  const rawCustomHtml = typeof req.body?.customHtml === "string" ? req.body.customHtml : "";
+  const customHtml = sanitizeCustomEmailHtml(rawCustomHtml);
   const logoUrl = req.body?.logoUrl === "" ? null : req.body?.logoUrl;
   const logoImage = req.body?.logoImageData;
   const imageProvided = Object.prototype.hasOwnProperty.call(req.body ?? {}, "logoImageData");
   if (brandName.length < 2 || brandName.length > 80) return fail(res, 400, "INVALID_BRAND_NAME", "Brand name must be between 2 and 80 characters.");
   if (!/^#[0-9a-f]{6}$/i.test(accentColor)) return fail(res, 400, "INVALID_ACCENT_COLOR", "Choose a valid six-digit hex color.");
   if (footerText.length > 500) return fail(res, 400, "INVALID_FOOTER", "Footer text cannot exceed 500 characters.");
+  if (customHtml.length > 60_000) return fail(res, 400, "CUSTOM_TEMPLATE_TOO_LARGE", "Custom email HTML cannot exceed 60 KB.");
+  if (customHtml.trim() && !/{{\s*body\s*}}/i.test(customHtml)) return fail(res, 400, "CUSTOM_TEMPLATE_BODY_REQUIRED", "Your custom design must include the {{body}} placeholder so the email message appears in the template.");
   if (logoUrl !== null && (typeof logoUrl !== "string" || logoUrl.length > 2000 || !/^https:\/\//i.test(logoUrl))) return fail(res, 400, "INVALID_LOGO_URL", "Logo must use a public HTTPS image URL.");
   if (imageProvided && logoImage !== null && (typeof logoImage !== "string" || !/^data:image\/(png|jpeg|webp);base64,[A-Za-z0-9+/]+={0,2}$/.test(logoImage) || Buffer.byteLength(logoImage, "utf8") > 1_500_000)) return fail(res, 400, "INVALID_LOGO_IMAGE", "Choose a PNG, JPG, or WebP logo smaller than 1 MB.");
   if (typeof logoImage === "string" && !process.env.WIDESIP_PUBLIC_URL?.startsWith("https://")) return fail(res, 503, "PUBLIC_IMAGE_HOST_NOT_CONFIGURED", "Set WIDESIP_PUBLIC_URL to your public HTTPS API address before uploading a logo.");
   try {
-    const [access] = await db.select({ id: domains.id, role: workspaceMembers.role }).from(domains)
+    const [access] = await db.select({ id: domains.id, domainName: domains.domainName, role: workspaceMembers.role }).from(domains)
       .innerJoin(workspaceMembers, eq(workspaceMembers.workspaceId, domains.workspaceId))
       .where(and(eq(domains.id, String(req.params.domainId)), eq(workspaceMembers.userId, req.userId!))).limit(1);
     if (!access) return fail(res, 404, "DOMAIN_NOT_FOUND", "The domain could not be found.");
     if (!["owner", "admin"].includes(access.role)) return fail(res, 403, "FORBIDDEN", "Only workspace owners and admins can manage domain email templates.");
     const logoMimeType = typeof logoImage === "string" ? /^data:(image\/(?:png|jpeg|webp));base64,/.exec(logoImage)?.[1] ?? null : null;
     const logoImageData = typeof logoImage === "string" ? logoImage.split(",", 2)[1] : imageProvided ? null : undefined;
-    const savedValues = { domainId: access.id, brandName, logoUrl: logoImage ? null : logoUrl, ...(imageProvided ? { logoImageData, logoMimeType } : {}), accentColor, footerText, updatedAt: new Date() };
-    const updateValues = { brandName, logoUrl: logoImage ? null : logoUrl, ...(imageProvided ? { logoImageData, logoMimeType } : {}), accentColor, footerText, updatedAt: new Date() };
+    const savedValues = { domainId: access.id, brandName, logoUrl: logoImage ? null : logoUrl, ...(imageProvided ? { logoImageData, logoMimeType } : {}), accentColor, footerText, customHtml, updatedAt: new Date() };
+    const updateValues = { brandName, logoUrl: logoImage ? null : logoUrl, ...(imageProvided ? { logoImageData, logoMimeType } : {}), accentColor, footerText, customHtml, updatedAt: new Date() };
     await db.insert(domainEmailTemplates).values(savedValues)
       .onConflictDoUpdate({ target: domainEmailTemplates.domainId, set: updateValues });
     const publicUrl = process.env.WIDESIP_PUBLIC_URL?.replace(/\/$/, "");
     const finalLogoUrl = logoImage && publicUrl ? `${publicUrl}/v1/public/domains/${access.id}/logo` : logoUrl;
-    return res.json({ success: true, data: { domainId: access.id, brandName, logoUrl: finalLogoUrl, hasUploadedLogo: typeof logoImage === "string", canUploadLogo: Boolean(publicUrl), accentColor, footerText }, message: "The domain profile was saved." });
+    const addresses = await db.select({ localPart: mailboxes.localPart, displayName: mailboxes.displayName })
+      .from(mailboxes).where(eq(mailboxes.domainId, access.id)).orderBy(asc(mailboxes.createdAt));
+    return res.json({ success: true, data: { domainId: access.id, domainName: access.domainName, brandName, logoUrl: finalLogoUrl, hasUploadedLogo: typeof logoImage === "string", canUploadLogo: Boolean(publicUrl), accentColor, footerText, customHtml, addresses }, message: "The domain email design was saved." });
   } catch (error) { next(error); }
 });
 
@@ -1573,7 +1581,7 @@ app.post("/v1/mailboxes/:mailboxId/messages", requireUser, async (req: AuthedReq
       displayName: mailboxes.displayName, domainName: domains.domainName, mailStatus: domains.mailStatus,
       domainId: domains.id, brandName: domainEmailTemplates.brandName, logoUrl: domainEmailTemplates.logoUrl,
       logoImageData: domainEmailTemplates.logoImageData, accentColor: domainEmailTemplates.accentColor,
-      footerText: domainEmailTemplates.footerText,
+      footerText: domainEmailTemplates.footerText, customHtml: domainEmailTemplates.customHtml,
       role: workspaceMembers.role,
     }).from(mailboxes).innerJoin(domains, eq(mailboxes.domainId, domains.id))
       .leftJoin(domainEmailTemplates, eq(domainEmailTemplates.domainId, domains.id))
@@ -1600,7 +1608,7 @@ app.post("/v1/mailboxes/:mailboxId/messages", requireUser, async (req: AuthedReq
       return fail(res, 429, "SEND_LIMIT", "You can send up to ten messages per minute during this test period.");
     }
 
-    const from = `${mailbox.displayName.replace(/[\r\n<>\"]/g, "").trim() || "Widesip"} <${mailbox.localPart}@${mailbox.domainName}>`;
+    const from = `${mailbox.displayName.replace(/[\r\n<>\"]/g, "").trim() || mailbox.localPart} <${mailbox.localPart}@${mailbox.domainName}>`;
     const publicUrl = process.env.WIDESIP_PUBLIC_URL?.replace(/\/$/, "");
     const html = renderBrandedMessageHtml({
       subject,
@@ -1610,7 +1618,10 @@ app.post("/v1/mailboxes/:mailboxId/messages", requireUser, async (req: AuthedReq
         logoUrl: mailbox.logoImageData && publicUrl ? `${publicUrl}/v1/public/domains/${mailbox.domainId}/logo` : mailbox.logoUrl,
         accentColor: mailbox.accentColor || "#4165e8",
         footerText: mailbox.footerText || "",
+        customHtml: mailbox.customHtml || "",
       },
+      senderName: mailbox.displayName.trim() || mailbox.localPart,
+      senderAddress: `${mailbox.localPart}@${mailbox.domainName}`,
     });
     const headers: Record<string, string> = {};
     if (replyMessage?.rfcMessageId) {

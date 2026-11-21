@@ -65,7 +65,7 @@ async function processCampaignQueueBatch() {
       scheduledAt: campaigns.scheduledAt, displayName: mailboxes.displayName, localPart: mailboxes.localPart,
       domainName: domains.domainName, domainId: domains.id, brandName: domainEmailTemplates.brandName,
       logoUrl: domainEmailTemplates.logoUrl, logoImageData: domainEmailTemplates.logoImageData,
-      accentColor: domainEmailTemplates.accentColor, footerText: domainEmailTemplates.footerText,
+      accentColor: domainEmailTemplates.accentColor, footerText: domainEmailTemplates.footerText, customHtml: domainEmailTemplates.customHtml,
     }).from(campaignRecipients)
       .innerJoin(campaigns, eq(campaigns.id, campaignRecipients.campaignId))
       .innerJoin(mailboxes, eq(mailboxes.id, campaigns.mailboxId))
@@ -93,16 +93,16 @@ async function processCampaignQueueBatch() {
         const name = candidate.recipientName ?? "";
         const contact = { id: null, email: candidate.email, name, consentSource: null, consentAt: null };
         const unsubscribeUrl = `${publicUrl}/v1/unsubscribe/${encodeURIComponent(tokenForRecipient(candidate.recipientId))}`;
-        const safeName = candidate.displayName.replace(/[\r\n<>\"]/g, "").trim() || "Widesip";
+        const safeName = candidate.displayName.replace(/[\r\n<>\"]/g, "").trim() || candidate.localPart;
         const personalizedSubject = personalizeCampaignText(candidate.subject, contact);
         const personalizedBody = personalizeCampaignText(candidate.body, contact);
-        const template = { brandName: candidate.brandName || safeName, logoUrl: candidate.logoImageData ? `${publicUrl}/v1/public/domains/${candidate.domainId}/logo` : candidate.logoUrl, accentColor: candidate.accentColor || "#4165e8", footerText: candidate.footerText || "" };
+        const template = { brandName: candidate.brandName || safeName, logoUrl: candidate.logoImageData ? `${publicUrl}/v1/public/domains/${candidate.domainId}/logo` : candidate.logoUrl, accentColor: candidate.accentColor || "#4165e8", footerText: candidate.footerText || "", customHtml: candidate.customHtml || "" };
         const textFooter = candidate.footerText ? `\n\n${candidate.footerText}` : "";
         const result = await getMailProvider().send({
           from: `${safeName} <${candidate.localPart}@${candidate.domainName}>`, to: [candidate.email],
           subject: personalizedSubject,
           text: `${personalizedBody}${textFooter}\n\n-\nUnsubscribe from these emails: ${unsubscribeUrl}`,
-          html: renderCampaignHtml({ subject: personalizedSubject, body: personalizedBody, unsubscribeUrl, template }),
+          html: renderCampaignHtml({ subject: personalizedSubject, body: personalizedBody, unsubscribeUrl, senderName: safeName, senderAddress: `${candidate.localPart}@${candidate.domainName}`, template }),
           headers: { "List-Unsubscribe": `<${unsubscribeUrl}>`, "List-Unsubscribe-Post": "List-Unsubscribe=One-Click" },
           attachments: candidate.attachments.map(file => ({ filename: file.filename, content: file.content, content_type: file.contentType })),
           tags: [{ name: "campaign_id", value: candidate.campaignId }, { name: "recipient_id", value: candidate.recipientId }],
@@ -313,7 +313,7 @@ router.patch("/v1/campaigns/:campaignId", requireUser, async (req: AuthedRequest
 });
 router.post("/v1/campaigns/:campaignId/send", requireUser, async (req: AuthedRequest, res, next) => {
   try {
-    const [campaign] = await db.select({ id: campaigns.id, workspaceId: campaigns.workspaceId, mailboxId: campaigns.mailboxId, name: campaigns.name, subject: campaigns.subject, body: campaigns.body, audienceMode: campaigns.audienceMode, audienceContactIds: campaigns.audienceContactIds, manualRecipients: campaigns.manualRecipients, manualConsentConfirmed: campaigns.manualConsentConfirmed, attachments: campaigns.attachments, status: campaigns.status, scheduledAt: campaigns.scheduledAt, role: workspaceMembers.role, localPart: mailboxes.localPart, displayName: mailboxes.displayName, domainId: domains.id, domainName: domains.domainName, mailStatus: domains.mailStatus, brandName: domainEmailTemplates.brandName, logoUrl: domainEmailTemplates.logoUrl, logoImageData: domainEmailTemplates.logoImageData, accentColor: domainEmailTemplates.accentColor, footerText: domainEmailTemplates.footerText }).from(campaigns).innerJoin(workspaceMembers, eq(workspaceMembers.workspaceId, campaigns.workspaceId)).innerJoin(mailboxes, eq(mailboxes.id, campaigns.mailboxId)).innerJoin(domains, eq(domains.id, mailboxes.domainId)).leftJoin(domainEmailTemplates, eq(domainEmailTemplates.domainId, domains.id)).where(and(eq(campaigns.id, String(req.params.campaignId)), eq(workspaceMembers.userId, req.userId!))).limit(1);
+    const [campaign] = await db.select({ id: campaigns.id, workspaceId: campaigns.workspaceId, mailboxId: campaigns.mailboxId, name: campaigns.name, subject: campaigns.subject, body: campaigns.body, audienceMode: campaigns.audienceMode, audienceContactIds: campaigns.audienceContactIds, manualRecipients: campaigns.manualRecipients, manualConsentConfirmed: campaigns.manualConsentConfirmed, attachments: campaigns.attachments, status: campaigns.status, scheduledAt: campaigns.scheduledAt, role: workspaceMembers.role, localPart: mailboxes.localPart, displayName: mailboxes.displayName, domainId: domains.id, domainName: domains.domainName, mailStatus: domains.mailStatus, brandName: domainEmailTemplates.brandName, logoUrl: domainEmailTemplates.logoUrl, logoImageData: domainEmailTemplates.logoImageData, accentColor: domainEmailTemplates.accentColor, footerText: domainEmailTemplates.footerText, customHtml: domainEmailTemplates.customHtml }).from(campaigns).innerJoin(workspaceMembers, eq(workspaceMembers.workspaceId, campaigns.workspaceId)).innerJoin(mailboxes, eq(mailboxes.id, campaigns.mailboxId)).innerJoin(domains, eq(domains.id, mailboxes.domainId)).leftJoin(domainEmailTemplates, eq(domainEmailTemplates.domainId, domains.id)).where(and(eq(campaigns.id, String(req.params.campaignId)), eq(workspaceMembers.userId, req.userId!))).limit(1);
     if (!campaign) return fail(res, 404, "CAMPAIGN_NOT_FOUND", "The campaign could not be found.");
     if (!(await canUseMailbox(req.userId!, campaign.workspaceId, campaign.role, campaign.mailboxId))) return fail(res, 404, "CAMPAIGN_NOT_FOUND", "The campaign could not be found.");
     if (campaign.status !== "draft") return fail(res, 409, "CAMPAIGN_ALREADY_SENT", "Only a draft campaign can be sent.");
