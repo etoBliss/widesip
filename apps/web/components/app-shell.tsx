@@ -196,6 +196,9 @@ export function AppShell({ children }: { children: ReactNode }) {
   const currentPage = !workspaceReady ? "Workspace" : pathname === "/app/domains/new" ? "Add domain" : allNavItems.find(item => pathname === item.href)?.label ?? allNavItems.filter(item => pathname.startsWith(`${item.href}/`)).sort((a, b) => b.href.length - a.href.length)[0]?.label ?? "Workspace";
   const memberLimited = workspace?.type === "organization" && workspace.role === "member";
   const organizationWorkspace = workspace?.type === "organization";
+  const personalWorkspace = workspace?.type === "personal";
+  const hasTeamWorkspace = workspaces.some(row => row.type === "organization");
+  const personalNeedsTeam = personalWorkspace && !hasTeamWorkspace;
   const organizationNeedsDomain = organizationWorkspace && workspace.hasVerifiedDomain === false;
   const personalName = accountUser?.name?.trim() || "Your space";
   const workspaceLabel = workspace?.type === "personal" ? personalName : workspace?.name ?? "Widesip";
@@ -206,22 +209,30 @@ export function AppShell({ children }: { children: ReactNode }) {
       ]
     : organizationWorkspace
       ? navGroups.map(group => ({ ...group, items: group.items.filter(item => item.label !== "Settings") })).filter(group => group.items.length)
-      : workspace?.type === "personal"
+      : personalNeedsTeam
+        ? [{ label: "TEAM", items: navGroups[1].items.filter(item => item.label === "Team") }]
+      : personalWorkspace
         ? [
             navGroups[0],
             { label: "TEAM", items: navGroups[1].items.filter(item => item.label === "Team") },
-            navGroups[2],
+            { ...navGroups[2], items: navGroups[2].items.filter(item => item.label !== "Usage & billing") },
           ]
         : navGroups;
   const memberAllowedPaths = ["/app/mail", "/app/mailboxes", "/app/contacts", "/app/campaigns", "/app/profile", "/app/team", "/app/team/invitations"];
   const personalTeamDashboard = workspace?.type === "personal" && pathname === "/app/team";
   const restrictedForMember = (memberLimited && !memberAllowedPaths.some(path => pathname === path || pathname.startsWith(`${path}/`)))
-    || (organizationWorkspace && pathname.startsWith("/app/settings"));
+    || (organizationWorkspace && pathname.startsWith("/app/settings"))
+    || (personalWorkspace && pathname.startsWith("/app/billing"))
+    || (personalNeedsTeam && !["/app/team", "/app/team/invitations", "/app/profile"].some(path => pathname === path || pathname.startsWith(`${path}/`)));
   useEffect(() => {
     if (!ready || !organizationNeedsDomain || pathname === "/app/domains" || pathname.startsWith("/app/domains/")) return;
     router.replace("/app/domains");
   }, [ready, organizationNeedsDomain, pathname, router]);
-  const restrictionCopy = "Your role in this workspace does not include this page. Ask a workspace owner or admin if you need access.";
+  const restrictionCopy = personalNeedsTeam
+    ? "Join a team workspace to access this page. You can review and accept invitations from the Team section."
+    : personalWorkspace && pathname.startsWith("/app/billing")
+      ? "Usage and billing are only available in an organization workspace."
+    : "Your role in this workspace does not include this page. Ask a workspace owner or admin if you need access.";
   function renderNavItem(item: NavItem) {
     const Icon = item.icon;
     const parentVisible = true;
@@ -247,7 +258,7 @@ export function AppShell({ children }: { children: ReactNode }) {
         </div></div>
       </header>
       {workspaceReady && <details className="app-mobile-menu"><summary><Menu size={17}/><span>{currentPage}</span><ChevronDown size={15}/></summary><nav aria-label="Workspace navigation">{visibleGroups.map((group) => <div className="app-mobile-group" key={group.label}><span>{group.label}</span>{group.items.flatMap(item => [{ ...item }, ...(item.children ?? []).map(child => ({ ...child }))]).map(item => { const Icon = item.icon; return <Link key={item.href} className={isActive(item.href) ? "active" : ""} href={item.href} onClick={(event) => event.currentTarget.closest("details")?.removeAttribute("open")}><Icon size={15}/>{item.label}</Link>; })}</div>)}</nav></details>}
-      <main className="app-content">{!ready || !accountUserReady ? <div className="app-loading"><span className="loading-orbit"/>Loading your workspace…</div> : loadError ? <section className="app-card"><div className="empty" role="alert">{loadError}<br/><Link href="/sign-in" className="app-text-link">Return to sign in →</Link></div></section> : organizationNeedsDomain && pathname !== "/app/domains" && !pathname.startsWith("/app/domains/") ? <div className="app-loading"><span className="loading-orbit"/>Opening required domain setup…</div> : restrictedForMember ? <section className="member-restricted-board"><span><LockKeyhole size={19}/></span><h1>Access restricted</h1><p>{restrictionCopy}</p></section> : personalTeamDashboard ? <><div className="page-heading"><div><h1>Team</h1><p>Join an organization workspace with an invitation.</p></div></div><section className="app-card personal-team-dashboard"><span className="personal-team-icon"><UsersRound size={20}/></span><div><h2>Your account is personal</h2><p>You can join organization teams when invited. Organization accounts create workspaces and send team invitations; your personal inbox and data stay private.</p></div><div className="personal-team-actions"><Link className="button secondary" href="/app/team/invitations"><MailCheck size={15}/>View team invitations<ArrowRight size={14}/></Link></div></section></> : <div key={workspace?.id ?? "workspace"}>{children}</div>}</main>
+      <main className="app-content">{!ready || !accountUserReady ? <div className="app-loading"><span className="loading-orbit"/>Loading your workspace…</div> : loadError ? <section className="app-card"><div className="empty" role="alert">{loadError}<br/><Link href="/sign-in" className="app-text-link">Return to sign in →</Link></div></section> : organizationNeedsDomain && pathname !== "/app/domains" && !pathname.startsWith("/app/domains/") ? <div className="app-loading"><span className="loading-orbit"/>Opening required domain setup…</div> : restrictedForMember ? <section className="member-restricted-board"><span><LockKeyhole size={19}/></span><h1>{personalNeedsTeam ? "Join a team to continue" : "Access restricted"}</h1><p>{restrictionCopy}</p>{personalNeedsTeam && <Link className="button secondary" href="/app/team/invitations"><MailCheck size={15}/>View team invitations<ArrowRight size={14}/></Link>}</section> : personalTeamDashboard ? <><div className="page-heading"><div><h1>Team</h1><p>Join an organization workspace with an invitation.</p></div></div><section className="app-card personal-team-dashboard"><span className="personal-team-icon"><UsersRound size={20}/></span><div><h2>Your account is personal</h2><p>You can join organization teams when invited. Organization accounts create workspaces and send team invitations; your personal inbox and data stay private.</p></div><div className="personal-team-actions"><Link className="button secondary" href="/app/team/invitations"><MailCheck size={15}/>View team invitations<ArrowRight size={14}/></Link></div></section></> : <div key={workspace?.id ?? "workspace"}>{children}</div>}</main>
     </div>
   </div>;
 }
