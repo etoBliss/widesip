@@ -206,11 +206,15 @@ export function AppShell({ children }: { children: ReactNode }) {
     ? [
         { label: "EMAIL & AUDIENCE", items: navGroups[0].items.filter(item => ["Inbox", "Addresses", "Contacts", "Campaigns"].includes(item.label)) },
         { label: "TEAM", items: navGroups[1].items.filter(item => item.label === "Team") },
+        { label: "PREFERENCES", items: navGroups[2].items.filter(item => item.label === "Settings") },
       ]
     : organizationWorkspace
-      ? navGroups.map(group => ({ ...group, items: group.items.filter(item => item.label !== "Settings") })).filter(group => group.items.length)
+      ? navGroups
       : personalNeedsTeam
-        ? [{ label: "TEAM", items: navGroups[1].items.filter(item => item.label === "Team") }]
+        ? [
+            { label: "TEAM", items: navGroups[1].items.filter(item => item.label === "Team") },
+            { label: "PREFERENCES", items: navGroups[2].items.filter(item => item.label === "Settings") },
+          ]
       : personalWorkspace
         ? [
             navGroups[0],
@@ -223,7 +227,7 @@ export function AppShell({ children }: { children: ReactNode }) {
   const restrictedForMember = (memberLimited && !memberAllowedPaths.some(path => pathname === path || pathname.startsWith(`${path}/`)))
     || (organizationWorkspace && pathname.startsWith("/app/settings"))
     || (personalWorkspace && pathname.startsWith("/app/billing"))
-    || (personalNeedsTeam && !["/app/team", "/app/team/invitations", "/app/profile"].some(path => pathname === path || pathname.startsWith(`${path}/`)));
+    || (personalNeedsTeam && !["/app/team", "/app/team/invitations", "/app/profile", "/app/settings"].some(path => pathname === path || pathname.startsWith(`${path}/`)));
   useEffect(() => {
     if (!ready || !organizationNeedsDomain || pathname === "/app/domains" || pathname.startsWith("/app/domains/")) return;
     router.replace("/app/domains");
