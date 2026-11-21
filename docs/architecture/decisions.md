@@ -14,7 +14,7 @@ Better Auth owns credential and session operations. Express mounts the Better Au
 
 ## Email infrastructure
 
-Resend is reserved for Widesip product notifications. Customer mailbox delivery remains behind separate provider adapters and is unavailable until inbound/outbound capabilities, limits, and costs are validated. Domain creation records a pending domain only; it does not claim DNS ownership or activate MX routing.
+Resend provides product email and customer domain sending/receiving through Widesip's server-side integration. Customer domains are registered in Widesip's Resend account; customers do not need their own Resend accounts. Receiving is enabled through Resend Forge and requires its returned MX record plus the verified `email.received` webhook path. Domain creation records a pending domain only; it does not claim DNS ownership or automatically replace existing root MX routes.
 
 ## Verification records
 

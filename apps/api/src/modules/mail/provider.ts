@@ -49,7 +49,8 @@ export interface MailProvider {
   findDomain(name: string): Promise<ProviderDomain | undefined>;
   createDomain(name: string, receiving?: boolean): Promise<ProviderDomain>;
   updateDomain(id: string, capabilities: DomainCapabilities): Promise<void>;
-  verifyDomain(id: string): Promise<void>;
+  enableForge(id: string): Promise<ProviderDomain>;
+  verifyDomain(id: string, scope?: "forge"): Promise<void>;
   send(message: SendMessage): Promise<{ id: string }>;
   cancelScheduled(id: string): Promise<void>;
   getReceivedMessage(id: string): Promise<ReceivedMessage>;
@@ -87,8 +88,14 @@ const resendProvider: MailProvider = {
   async updateDomain(id, capabilities) {
     await resendRequest(`/domains/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify({ capabilities }) });
   },
-  async verifyDomain(id) {
-    await resendRequest(`/domains/${encodeURIComponent(id)}/verify`, { method: "POST" });
+  async enableForge(id) {
+    // Forge returns the current domain records, including the receiving MX
+    // when receiving is enabled. Repeating this is idempotent at Resend.
+    await resendRequest(`/domains/${encodeURIComponent(id)}/forge`, { method: "POST", body: JSON.stringify({}) });
+    return resendRequest<ProviderDomain>(`/domains/${encodeURIComponent(id)}`);
+  },
+  async verifyDomain(id, scope) {
+    await resendRequest(`/domains/${encodeURIComponent(id)}/verify`, { method: "POST", body: JSON.stringify(scope ? { scope: [scope] } : {}) });
   },
   send: (message) => {
     const { scheduledAt, idempotencyKey, ...payload } = message;

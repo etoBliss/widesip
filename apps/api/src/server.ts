@@ -6,7 +6,7 @@ import { resolveTxt } from "node:dns/promises";
 import { toNodeHandler, fromNodeHeaders } from "better-auth/node";
 import { and, asc, count, desc, eq, gt, gte, ilike, inArray, like, lt, ne, or, sql } from "drizzle-orm";
 import { auth } from "./auth.js";
-import { getMailProvider, type ProviderDomain } from "./modules/mail/provider.js";
+import { getMailProvider, type MailDnsRecord, type ProviderDomain } from "./modules/mail/provider.js";
 import { renderBrandedMessageHtml } from "./modules/mail/campaign-template.js";
 import { classifyInboundMessage, normalizeSenderAddress } from "./modules/mail/classification.js";
 import { validateEmailAttachments } from "./modules/mail/attachments.js";
@@ -549,8 +549,10 @@ app.get("/v1/integrations/cloudflare/callback", async (req, res) => {
 });
 
 function normalizedDnsName(name: string, zone: string) {
-  const trimmed = name.trim().replace(/\.$/, "");
-  return trimmed === zone || trimmed.endsWith(`.${zone}`) ? trimmed : `${trimmed}.${zone}`;
+  const normalizedZone = zone.trim().replace(/\.$/, "").toLowerCase();
+  const trimmed = name.trim().replace(/\.$/, "").toLowerCase();
+  if (!trimmed || trimmed === "@" || trimmed === normalizedZone) return normalizedZone;
+  return trimmed.endsWith(`.${normalizedZone}`) ? trimmed : `${trimmed}.${normalizedZone}`;
 }
 
 function comparableDnsValue(value: string) {
@@ -1214,19 +1216,23 @@ app.post("/v1/domains/:domainId/mail-setup", requireUser, async (req: AuthedRequ
       await provider.updateDomain(providerDomain.id, { sending: "enabled", receiving: receivingEnabled ? "enabled" : "disabled" });
       providerDomain = await provider.getDomain(providerDomain.id);
     }
-    if (!receivingSpecified && providerDomain.capabilities?.receiving === "enabled") receivingEnabled = true;
+    if (!receivingSpecified && ["enabled", "pending", "verified"].includes(providerDomain.capabilities?.receiving ?? "")) receivingEnabled = true;
+    if (receivingEnabled && provider.id === "resend") {
+      providerDomain = await provider.enableForge(providerDomain.id);
+    }
 
     const zoneId = process.env.NODE_ENV === "production" ? domain.cloudflareZoneId : process.env.CLOUDFLARE_ZONE_ID;
     const oauthToken = process.env.NODE_ENV === "production" ? await freshCloudflareAccessToken(domain.id) : null;
     // Production writes are authorized by this workspace's OAuth grant and
     // the zone selected from the Cloudflare account that granted it.
     const canWriteDns = Boolean(zoneId && (oauthToken || (process.env.NODE_ENV !== "production" && process.env.CLOUDFLARE_API_TOKEN)));
-    const dnsRecords = [...(providerDomain.records ?? [])].sort((left, right) => {
+    let dnsRecords = [...(providerDomain.records ?? [])].sort((left, right) => {
       const leftRootMx = left.type.toUpperCase() === "MX" && normalizedDnsName(left.name, domain.domainName) === domain.domainName;
       const rightRootMx = right.type.toUpperCase() === "MX" && normalizedDnsName(right.name, domain.domainName) === domain.domainName;
       return Number(rightRootMx) - Number(leftRootMx);
     });
     const applied: string[] = [];
+    const conflicts: MailDnsRecord[] = [];
     if (canWriteDns) {
       for (const record of dnsRecords) {
         const type = record.type.toUpperCase();
@@ -1238,7 +1244,8 @@ app.post("/v1/domains/:domainId/mail-setup", requireUser, async (req: AuthedRequ
         // Never replace an existing root MX route. Exact matches above are safe,
         // including a verified test subdomain's own MX record.
         if (type === "MX" && name === domain.domainName && current.length > 0) {
-          return fail(res, 409, "ROOT_MX_PROTECTED", "An MX record already exists at this domain. Widesip stopped before changing it so existing mail routing stays intact.");
+          conflicts.push(record);
+          continue;
         }
         const conflicting = current.find((item) => {
           if (type === "TXT") return record.value.toLowerCase().startsWith("v=spf1") && item.content.toLowerCase().startsWith("v=spf1");
@@ -1254,25 +1261,41 @@ app.post("/v1/domains/:domainId/mail-setup", requireUser, async (req: AuthedRequ
         }, oauthToken ?? undefined);
         applied.push(`${type} ${name}`);
       }
-      await provider.verifyDomain(providerDomain.id);
+      await provider.verifyDomain(providerDomain.id, receivingEnabled && provider.id === "resend" ? "forge" : undefined);
       providerDomain = await provider.getDomain(providerDomain.id);
+      dnsRecords = [...(providerDomain.records ?? [])].sort((left, right) => {
+        const leftRootMx = left.type.toUpperCase() === "MX" && normalizedDnsName(left.name, domain.domainName) === domain.domainName;
+        const rightRootMx = right.type.toUpperCase() === "MX" && normalizedDnsName(right.name, domain.domainName) === domain.domainName;
+        return Number(rightRootMx) - Number(leftRootMx);
+      });
     }
 
     const active = providerDomain.status === "verified";
+    const receivingMx = dnsRecords.find((record) => record.type.toUpperCase() === "MX" && normalizedDnsName(record.name, domain.domainName) === domain.domainName);
+    const receivingMxAvailable = Boolean(receivingMx);
     await db.update(domains).set({ mailStatus: active ? "active" : "pending", receivingEnabled }).where(eq(domains.id, domain.id));
     res.json({ success: true, data: {
       status: providerDomain.status,
       receivingEnabled,
       receivingStatus: providerDomain.capabilities?.receiving ?? (receivingEnabled ? "enabled" : "disabled"),
+      receivingMxAvailable,
+      receivingMxStatus: receivingMx?.status ?? "unknown",
       domainId: providerDomain.id,
       dnsAutomated: canWriteDns,
       appliedRecords: applied,
+      conflicts,
       records: dnsRecords,
-      message: active
-        ? "Widesip verified this domain for sending. Your existing root MX records were left unchanged."
+      message: receivingEnabled && !receivingMxAvailable
+        ? "The sending records are available, but Resend has not returned a receiving MX record. Incoming mail is not routed to Widesip yet."
+        : active
+        ? conflicts.length
+          ? "Sending is verified. Widesip left your existing root MX records unchanged; replace them only if you want all mail for this domain routed to Widesip."
+          : "Widesip verified this domain for sending."
         : canWriteDns
-          ? "DNS records were added without replacing existing records. The mail service is checking them; select Check sending status after a few minutes."
-          : "Widesip supplied the sending records. Add them in your DNS provider, then select Check sending status. Existing root MX records are not part of this setup.",
+          ? conflicts.length
+            ? "DNS records were added where safe. Widesip left your existing root MX records unchanged; replace them only if you want all mail for this domain routed to Widesip."
+            : "DNS records were added where safe. The mail service is checking them; select Check mail DNS after a few minutes."
+          : "Widesip supplied the DNS records. Add them in your DNS provider, then select Check mail DNS. Existing root MX records are not changed automatically.",
     } });
   } catch (error) {
     return fail(res, 502, "MAIL_SETUP_FAILED", error instanceof Error ? error.message : "Could not prepare mail delivery setup.");
@@ -1284,6 +1307,7 @@ app.post("/v1/domains/:domainId/mail-setup/verify", requireUser, async (req: Aut
     const [domain] = await db.select({
       id: domains.id, workspaceId: domains.workspaceId, sendingProvider: domains.sendingProvider,
       sendingProviderDomainId: domains.sendingProviderDomainId, resendDomainId: domains.resendDomainId,
+      domainName: domains.domainName, receivingEnabled: domains.receivingEnabled,
       role: workspaceMembers.role,
     }).from(domains).innerJoin(workspaceMembers, eq(workspaceMembers.workspaceId, domains.workspaceId))
       .where(and(eq(domains.id, String(req.params.domainId)), eq(workspaceMembers.userId, req.userId!))).limit(1);
@@ -1293,13 +1317,29 @@ app.post("/v1/domains/:domainId/mail-setup/verify", requireUser, async (req: Aut
     if (!providerDomainId) return fail(res, 409, "SENDING_NOT_STARTED", "Start sending setup first.");
     const provider = getMailProvider();
     const providerDomain = await provider.getDomain(providerDomainId);
-    if (providerDomain.status !== "verified") await provider.verifyDomain(providerDomainId);
+    if (domain.receivingEnabled && provider.id === "resend") await provider.verifyDomain(providerDomainId, "forge");
+    else if (providerDomain.status !== "verified") await provider.verifyDomain(providerDomainId);
     const checked = await provider.getDomain(providerDomainId);
     const active = checked.status === "verified";
     await db.update(domains).set({ mailStatus: active ? "active" : "pending" }).where(eq(domains.id, domain.id));
     const receivingEnabled = checked.capabilities?.receiving === "enabled" || checked.capabilities?.receiving === "verified" || checked.capabilities?.receiving === "pending";
     await db.update(domains).set({ mailStatus: active ? "active" : "pending", receivingEnabled }).where(eq(domains.id, domain.id));
-    res.json({ success: true, data: { status: checked.status, verified: active, receivingEnabled, receivingStatus: checked.capabilities?.receiving ?? "unknown", message: active ? "Sending domain is verified and ready." : "The mail service is still checking DNS. Allow a little time for the records to propagate, then check again." } });
+    const records = checked.records ?? [];
+    const receivingMx = records.find((record) => record.type.toUpperCase() === "MX" && normalizedDnsName(record.name, domain.domainName) === domain.domainName);
+    res.json({ success: true, data: {
+      status: checked.status,
+      verified: active,
+      receivingEnabled,
+      receivingStatus: checked.capabilities?.receiving ?? "unknown",
+      receivingMxAvailable: Boolean(receivingMx),
+      receivingMxStatus: receivingMx?.status ?? "unknown",
+      records,
+      message: !receivingMx && receivingEnabled
+        ? "Sending can be verified, but Resend has not returned a root receiving MX record for this domain yet. Incoming mail is not routed to Widesip."
+        : active
+          ? "Sending domain is verified. Check the receiving MX status separately before changing your current mail route."
+          : "The mail service is still checking DNS. Allow a little time for the records to propagate, then check again.",
+    } });
   } catch (error) {
     return fail(res, 502, "MAIL_STATUS_CHECK_FAILED", error instanceof Error ? error.message : "Could not check mail DNS status.");
   }
