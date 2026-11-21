@@ -49,7 +49,8 @@ function rateLimitFingerprint(scope: string, value: string) {
 // externally embedded newsletter form as the only frameable HTML endpoint;
 // all API, auth, and other HTML responses deny framing.
 app.use((req, res, next) => {
-  const embeddedSignup = req.path.startsWith("/v1/subscribe/") && req.query.embed === "1";
+  const publicSignup = req.path.startsWith("/v1/subscribe/");
+  const embeddedSignup = publicSignup && req.query.embed === "1";
   const cspNonce = randomBytes(18).toString("base64");
   res.locals.cspNonce = cspNonce;
   res.setHeader("X-Content-Type-Options", "nosniff");
@@ -57,11 +58,11 @@ app.use((req, res, next) => {
   res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
   res.setHeader("Cache-Control", "no-store");
   if (process.env.NODE_ENV === "production") res.setHeader("Strict-Transport-Security", "max-age=31536000");
-  if (embeddedSignup) {
+  if (publicSignup) {
     // The form is intentionally embeddable by customer websites. It contains
     // no authenticated data; the high-entropy public subscription token only
     // identifies the target organization's signup list.
-    res.setHeader("Content-Security-Policy", `default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${cspNonce}'; form-action 'self'; base-uri 'none'; frame-ancestors *`);
+    res.setHeader("Content-Security-Policy", `default-src 'none'; style-src 'nonce-${cspNonce}'; script-src 'nonce-${cspNonce}'; form-action 'self'; base-uri 'none'; frame-ancestors ${embeddedSignup ? "*" : "'none'"}`);
   } else {
     res.setHeader("X-Frame-Options", "DENY");
     res.setHeader("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'");
@@ -71,11 +72,43 @@ app.use((req, res, next) => {
 
 function subscriptionPage(token: string, state: "form" | "success" | "error" = "form", message = "", brandName = "Widesip", embedded = false, cspNonce = "") {
   const content = state === "success"
-    ? `<div class="success-mark">✓</div><h1>You’re on the list.</h1><p>Thanks for subscribing to ${escapeHtml(brandName)} updates. You can close this page.</p>`
-    : `<span class="eyebrow">${escapeHtml(brandName)} NEWSLETTER</span><h1>Good things, in your inbox.</h1><p>Subscribe to receive updates and news. You can unsubscribe at any time.</p>${message ? `<div class="notice">${escapeHtml(message)}</div>` : ""}<form method="post" action="/v1/subscribe/${token}${embedded ? "?embed=1" : ""}"><label>First name <input name="firstName" maxlength="100" autocomplete="given-name" required></label><label>Last name <input name="lastName" maxlength="100" autocomplete="family-name"></label><label>Email address <input name="email" type="email" maxlength="254" required autocomplete="email" placeholder="you@example.com"></label><label class="consent"><input type="checkbox" name="consent" value="yes" required><span>I agree to receive newsletter emails. I can unsubscribe at any time.</span></label><div class="website-field" aria-hidden="true"><label>Leave this field empty<input name="website_url" tabindex="-1" autocomplete="off"></label></div><button type="submit">Subscribe</button><small>We’ll use your email only for ${escapeHtml(brandName)} email updates.</small></form>`;
-  const embeddedCss = embedded ? ".embedded{background:transparent;min-height:auto;display:block;padding:8px}.embedded .card{width:100%;max-width:none;padding:24px;border:0;box-shadow:none}.embedded .mark{display:none}" : "";
+    ? `<div class="success-mark" aria-hidden="true">✓</div><span class="eyebrow">SUBSCRIPTION CONFIRMED</span><h1>You’re on the list.</h1><p>Thanks for subscribing to ${escapeHtml(brandName)} updates. You can close this page.</p>`
+    : `<span class="eyebrow">${escapeHtml(brandName)} &nbsp;·&nbsp; NEWSLETTER</span><h1>Good things,<br>in your inbox.</h1><p>Thoughtful updates, new ideas, and occasional news from ${escapeHtml(brandName)}. Unsubscribe whenever you like.</p>${message ? `<div class="notice" role="alert">${escapeHtml(message)}</div>` : ""}<form method="post" action="/v1/subscribe/${token}${embedded ? "?embed=1" : ""}"><label>First name <input name="firstName" maxlength="100" autocomplete="given-name" required></label><label>Last name <input name="lastName" maxlength="100" autocomplete="family-name"></label><label>Email address <input name="email" type="email" maxlength="254" required autocomplete="email" placeholder="you@example.com"></label><label class="consent"><input type="checkbox" name="consent" value="yes" required><span>I agree to receive email updates. I can unsubscribe at any time.</span></label><div class="website-field" aria-hidden="true"><label>Leave this field empty<input name="website_url" tabindex="-1" autocomplete="off"></label></div><button type="submit">Join the list <span aria-hidden="true">→</span></button><small>We’ll use your email only for ${escapeHtml(brandName)} updates.</small></form>`;
+  const embeddedCss = embedded ? ".embedded{min-height:auto;display:block;padding:8px;background:transparent}.embedded .card{width:100%;max-width:none;padding:25px;border:0;box-shadow:none}.embedded .brand-row{margin-bottom:22px}" : "";
   const completionMessage = embedded && state === "success" ? `<script nonce="${cspNonce}">try{parent.postMessage({type:"widesip:subscription-complete"},new URL(document.referrer).origin)}catch{}</script>` : "";
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light"><title>Subscribe - ${escapeHtml(brandName)}</title><style>*{box-sizing:border-box}body{min-height:100vh;margin:0;padding:24px;display:grid;place-items:center;background:#f5f7fb;color:#10233f;font:15px Arial,Helvetica,sans-serif}.card{width:min(100%,470px);padding:36px;background:#fff;border:1px solid #e5eaf2;border-radius:18px;box-shadow:0 24px 70px #10233f12}.mark{width:38px;height:38px;margin-bottom:24px;display:grid;place-items:center;border-radius:12px;background:#356ae6;color:#fff;font-size:20px;font-weight:700}.eyebrow{color:#356ae6;font-size:10px;font-weight:700;letter-spacing:.13em}.card h1{margin:11px 0;color:#10233f;font-size:30px;line-height:1.15;letter-spacing:-1px}.card p{margin:0 0 24px;color:#68778d;font-size:14px;line-height:1.7}.card form{display:grid;gap:15px}.card form>label:not(.consent){display:grid;gap:7px;color:#35465f;font-size:12px;font-weight:650}.card input:not([type=checkbox]){width:100%;height:45px;padding:0 12px;border:1px solid #dfe5ef;border-radius:9px;background:#fff;color:#10233f;font:14px Arial,Helvetica,sans-serif}.card input:focus{outline:3px solid #356ae61c;border-color:#356ae6}.consent{display:flex;gap:9px;align-items:flex-start;color:#68778d;font-size:11px;line-height:1.5}.consent input{margin-top:2px;accent-color:#356ae6}.card button{height:46px;border:0;border-radius:9px;background:#356ae6;color:#fff;font-size:13px;font-weight:700;cursor:pointer}.card button:hover{background:#2858c9}.card form>small{color:#8995a7;font-size:10px;line-height:1.5;text-align:center}.notice{margin:-8px 0 16px;padding:11px;border-radius:8px;background:#fff2ef;color:#a43f36;font-size:12px;line-height:1.5}.success-mark{width:44px;height:44px;margin-bottom:18px;display:grid;place-items:center;border-radius:50%;background:#e7f6ef;color:#13875d;font-size:24px;font-weight:bold}.website-field{position:absolute;left:-10000px;width:1px;height:1px;overflow:hidden}@media(max-width:520px){body{padding:15px}.card{padding:26px 21px;border-radius:14px}.card h1{font-size:26px}}${embeddedCss}</style></head><body class="${embedded ? "embedded" : ""}"><main class="card"><div class="mark">w</div>${content}</main>${completionMessage}</body></html>`;
+  const pageCss = `
+    *{box-sizing:border-box}
+    body{min-height:100vh;margin:0;padding:38px 20px;display:grid;place-items:center;background:radial-gradient(ellipse at 50% 0%,#e9edff 0,transparent 44%),#f4f6fb;color:#17243d;font:15px/1.5 Arial,Helvetica,sans-serif}
+    .card{width:min(100%,500px);padding:38px 42px 35px;background:#fff;border:1px solid #e4e9f2;border-radius:20px;box-shadow:0 24px 70px #23365b12}
+    .brand-row{display:flex;align-items:center;gap:10px;margin-bottom:34px}
+    .mark{width:36px;height:36px;display:grid;place-items:center;border-radius:11px;background:#4d63e9;color:#fff;font-size:19px;font-weight:750;box-shadow:0 5px 12px #4d63e933}
+    .brand-word{color:#182742;font-size:16px;font-weight:750;letter-spacing:-.45px}
+    .eyebrow{display:inline-block;margin-bottom:10px;color:#6274d7;font-size:9px;font-weight:750;letter-spacing:.14em;text-transform:uppercase}
+    .card h1{margin:0 0 12px;color:#17243d;font-size:34px;line-height:1.12;letter-spacing:-1.35px}
+    .card>p{margin:0 0 27px;color:#748198;font-size:13px;line-height:1.75}
+    .card form{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:15px 13px}
+    .card form>label:not(.consent){display:grid;gap:7px;color:#364762;font-size:10px;font-weight:700}
+    .card form>label:nth-of-type(3),.card form>.consent,.card form>button,.card form>small{grid-column:1/-1}
+    .card input:not([type=checkbox]){width:100%;height:45px;padding:0 12px;border:1px solid #dfe5ef;border-radius:9px;background:#fff;color:#17243d;font:13px Arial,Helvetica,sans-serif;transition:border-color .15s,box-shadow .15s}
+    .card input::placeholder{color:#a1aabb}
+    .card input:focus{outline:0;border-color:#6275e9;box-shadow:0 0 0 3px #6275e91c}
+    .consent{display:flex;gap:9px;align-items:flex-start;color:#748198;font-size:10px;line-height:1.55}
+    .consent input{width:15px;height:15px;margin:1px 0 0;accent-color:#5269e8;flex:none}
+    .card button{height:47px;display:flex;align-items:center;justify-content:center;gap:10px;border:0;border-radius:10px;background:#4d63e9;color:#fff;font-size:12px;font-weight:700;cursor:pointer;box-shadow:0 6px 16px #4d63e92b;transition:transform .15s,background .15s,box-shadow .15s}
+    .card button:hover{transform:translateY(-1px);background:#3f55d8;box-shadow:0 9px 20px #4d63e938}
+    .card button span{font-size:16px}
+    .card form>small{color:#929db0;font-size:9px;line-height:1.55;text-align:center}
+    .card-foot{margin:23px 0 0!important;padding-top:15px;border-top:1px solid #edf0f5;color:#a1a9b8!important;font-size:9px!important;line-height:1.5!important;text-align:center}
+    .notice{margin:-9px 0 17px;padding:11px 12px;border:1px solid #f0d7d5;border-radius:9px;background:#fff8f7;color:#a34d48;font-size:11px;line-height:1.55}
+    .success-mark{width:46px;height:46px;margin-bottom:20px;display:grid;place-items:center;border-radius:14px;background:#e9f7f0;color:#278663;font-size:24px;font-weight:bold}
+    .website-field{position:absolute;left:-10000px;width:1px;height:1px;overflow:hidden}
+    .embedded{min-height:auto;display:grid;padding:10px;background:transparent}
+    .embedded .card{width:100%;max-width:none;padding:28px;border-radius:16px;box-shadow:none}
+    .embedded .brand-row{margin-bottom:24px}
+    @media(max-width:560px){body{padding:18px 14px}.card{padding:29px 23px;border-radius:16px}.card h1{font-size:29px}.card form{grid-template-columns:1fr}.card form>label{grid-column:1/-1}}
+    ${embeddedCss}
+  `;
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light"><title>Subscribe - ${escapeHtml(brandName)}</title><style nonce="${cspNonce}">${pageCss}</style></head><body class="${embedded ? "embedded" : ""}"><main class="card"><div class="brand-row"><div class="mark" aria-hidden="true">w</div><span class="brand-word">widesip</span></div>${content}<p class="card-foot">A calmer way to stay in touch.</p></main>${completionMessage}</body></html>`;
 }
 function normalizedThreadSubject(subject: string) {
   return subject.trim().replace(/^(?:(?:re|fw|fwd)\s*:\s*)+/i, "").trim().toLowerCase() || "(no subject)";
