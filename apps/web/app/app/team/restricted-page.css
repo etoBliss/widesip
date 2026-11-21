@@ -1,0 +1,17 @@
+.member-restricted-board{min-height:min(56vh,520px);display:flex;flex-direction:column;align-items:center;justify-content:center;padding:40px 24px;border:1px solid #e8edf5;border-radius:18px;background:linear-gradient(145deg,#fff,#fbfcff);text-align:center}
+.member-restricted-board>span{display:grid;place-items:center;width:48px;height:48px;margin-bottom:16px;border:1px solid #e3e9f3;border-radius:15px;background:#f5f7fb;color:#71809a}
+.member-restricted-board h1{margin:0;color:#1c2e49;font-size:20px;letter-spacing:-.4px}
+.member-restricted-board p{max-width:390px;margin:9px 0 0;color:#78869a;font-size:13px;line-height:1.65}
+.account-workspace-switch{display:grid;gap:7px;padding:8px 9px 11px}
+.account-workspace-switch>span{color:#8995a8;font-size:9px;font-weight:650;letter-spacing:.04em}
+.account-workspace-switch .styled-select-trigger{height:40px;border-radius:9px;background:#fbfcfe;font-size:10px}
+.account-workspace-empty{display:block;padding:11px 12px;border:1px solid #e5eaf2;border-radius:9px;background:#fbfcfe;color:#52627b;font-size:11px}
+.account-workspace-hint,.account-workspace-error{display:block;margin-top:2px;color:#78869a;font-size:10px;line-height:1.5}
+.account-workspace-error{color:#b5473b}
+.personal-team-dashboard{display:grid;grid-template-columns:auto minmax(0,1fr);align-items:start;gap:15px;padding:26px}
+.personal-team-icon{display:grid;place-items:center;width:44px;height:44px;border:1px solid #e2e9fa;border-radius:13px;background:#f2f5ff;color:#4967dc}
+.personal-team-dashboard h2{margin:2px 0 6px;color:#1e304a;font-size:16px;letter-spacing:-.25px}
+.personal-team-dashboard p{max-width:650px;margin:0;color:#75839a;font-size:12px;line-height:1.7}
+.personal-team-actions{grid-column:2;display:flex;flex-wrap:wrap;gap:9px;margin-top:3px}
+.personal-team-actions .button{display:inline-flex;align-items:center;gap:8px}
+@media(max-width:620px){.personal-team-dashboard{grid-template-columns:1fr;padding:20px}.personal-team-actions{grid-column:1}.personal-team-actions .button{width:100%;justify-content:center}}

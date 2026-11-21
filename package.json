@@ -1,0 +1,8 @@
+{
+  "name": "widesip",
+  "private": true,
+  "packageManager": "pnpm@10.20.0",
+  "engines": { "node": ">=26 <27" },
+  "scripts": { "dev": "turbo dev", "build": "turbo build", "typecheck": "turbo typecheck", "lint": "turbo lint", "format": "prettier --write .", "db:push": "pnpm --filter @widesip/database db:push", "db:generate": "pnpm --filter @widesip/database db:generate" },
+  "devDependencies": { "prettier": "^3.6.2", "turbo": "^2.5.8", "typescript": "^5.9.3" }
+}

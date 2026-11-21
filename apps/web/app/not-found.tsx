@@ -1,0 +1,6 @@
+import Link from "next/link";
+import { ArrowLeft, ArrowRight, Sparkles } from "lucide-react";
+
+export default function NotFound() {
+  return <main className="not-found-page"><header className="not-found-header"><Link className="brand" href="/"><span className="mark">w</span><span>widesip</span></Link><Link className="not-found-back" href="/"><ArrowLeft size={14}/> Back to Widesip</Link></header><section className="not-found-card"><div className="not-found-art" aria-hidden="true"><span className="not-found-orbit orbit-one"/><span className="not-found-orbit orbit-two"/><span className="not-found-code">404</span><span className="not-found-spark"><Sparkles size={17}/></span></div><h1>This page isn’t in this workspace.</h1><p>The address may have changed, or the page may still be taking shape. Let’s get you somewhere useful.</p><Link className="button" href="/">Go to the homepage <ArrowRight size={15}/></Link></section><footer className="not-found-footer">WIDESIP · YOUR EMAIL. YOUR DOMAINS. ONE PLACE.</footer></main>;
+}

@@ -1,0 +1,12 @@
+.onboarding-progress{display:grid;gap:7px;margin:4px 0 15px;color:#8190a6;font-size:8px;font-weight:700;letter-spacing:.1em}
+.onboarding-progress>i{height:4px;overflow:hidden;border-radius:9px;background:#e8ecf5}
+.onboarding-progress>i>b{display:block;height:100%;border-radius:inherit;background:linear-gradient(90deg,#536de5,#7990f5);transition:width .2s ease}
+.onboarding-actions{display:flex;gap:9px;margin-top:7px}
+.onboarding-actions .button{display:inline-flex;align-items:center;justify-content:center;gap:7px}
+.onboarding-actions .button.secondary{flex:0 0 92px;width:auto}
+.onboarding-actions .button.auth-wide-button{flex:1}
+.onboarding-card .field small{color:#8995a7;font-size:8px;line-height:1.5}
+.onboarding-card .workspace-choice{min-height:76px}
+.onboarding-card .workspace-choice b{font-size:10px}
+.onboarding-card .workspace-choice small{font-size:8px;line-height:1.4}
+@media(max-width:560px){.onboarding-card .workspace-choice{min-height:65px}.onboarding-card .workspace-choice b{font-size:9px}.onboarding-card .workspace-choice small{font-size:7px}}

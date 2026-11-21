@@ -1,0 +1,81 @@
+@media(max-width:1120px){
+  .app-shell{grid-template-columns:232px minmax(0,1fr)}
+  .app-content{padding-inline:28px}
+  .app-header{padding-inline:28px}
+  .dashboard-hero{grid-template-columns:minmax(0,1fr) 230px;padding-inline:27px}
+  .dashboard-hero-foot{left:27px;right:27px}
+  .dashboard-art-label{right:-10px}
+  .dashboard-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}
+}
+@media(max-width:900px){
+  .app-shell{display:block;min-height:100vh}
+  .app-side{display:none}
+  .app-header{height:61px;padding-inline:22px}
+  .app-mobile-menu{position:sticky;top:61px;z-index:9;display:block;background:#fffffff2;border-bottom:1px solid #e8ecf2;backdrop-filter:blur(16px)}
+  .app-mobile-menu>summary{height:43px;display:flex;align-items:center;gap:9px;padding:0 22px;list-style:none;color:#61718b;font-size:10px;font-weight:650;cursor:pointer}
+  .app-mobile-menu>summary::-webkit-details-marker{display:none}
+  .app-mobile-menu>summary svg:last-child{margin-left:auto;transition:transform .2s}
+  .app-mobile-menu[open]>summary svg:last-child{transform:rotate(180deg)}
+  .app-mobile-menu nav{position:absolute;top:43px;left:0;right:0;max-height:calc(100svh - 104px);overflow:auto;padding:16px 22px 20px;border-bottom:1px solid #e4e8f0;background:#fff;box-shadow:0 22px 40px #1a2d4b16;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}
+  .app-mobile-group{display:grid;align-content:start;gap:4px}
+  .app-mobile-group>span{padding:0 9px 5px;color:#a0a9b7;font-size:8px;font-weight:750;letter-spacing:.12em}
+  .app-mobile-group a{display:flex;align-items:center;gap:9px;padding:9px;border-radius:8px;color:#718096;font-size:10px}
+  .app-mobile-group a.active{background:#eef1ff;color:#455ed5}
+  .app-content{padding:27px 24px 45px}
+}
+@media(max-width:650px){
+  .hero{min-height:auto}
+  .app-header{height:56px;padding-inline:15px}
+  .app-header-kicker{font-size:7px}
+  .app-breadcrumb{font-size:10px}
+  .app-header-actions{gap:10px}
+  .app-header-meta{font-size:0}
+  .app-header-avatar{width:29px;height:29px}
+  .app-mobile-menu{top:56px}
+  .app-mobile-menu>summary{height:40px;padding-inline:15px}
+  .app-mobile-menu nav{top:40px;padding:13px 15px 18px;gap:12px}
+  .app-content{padding:22px 15px 36px}
+  .page-heading{align-items:flex-start}
+  .page-heading h1{font-size:24px}
+  .dashboard-heading{align-items:flex-start}
+  .dashboard-heading>.button{padding:10px 11px;font-size:10px}
+  .dashboard-hero{min-height:330px;grid-template-columns:1fr;padding:23px 20px 50px}
+  .dashboard-hero h2{font-size:24px;max-width:410px}
+  .dashboard-hero-copy>p{max-width:390px}
+  .dashboard-hero-art{position:absolute;right:0;bottom:24px;width:190px;height:145px;opacity:.78}
+  .dashboard-art-core{width:55px;height:55px;border-radius:18px}
+  .dashboard-art-core .mark{width:33px;height:33px}
+  .orbit-outer{width:165px;height:90px}
+  .orbit-inner{width:128px;height:69px}
+  .dashboard-art-node{width:31px;height:31px;border-radius:10px}
+  .dashboard-art-node svg{width:14px}
+  .dashboard-art-node.node-domain{left:4px;top:30px}
+  .dashboard-art-node.node-mail{right:1px;top:54px}
+  .dashboard-art-node.node-team{left:29px;bottom:9px}
+  .dashboard-art-label{font-size:7px;right:2px;bottom:0}
+  .dashboard-hero-foot{left:20px;right:20px}
+  .dashboard-hero-foot span:last-child{display:none}
+  .dashboard-metrics{gap:8px}
+  .dashboard-metric{min-height:100px;padding:12px;gap:8px}
+  .dashboard-metric-icon{width:29px;height:29px;border-radius:8px}
+  .dashboard-metric-icon svg{width:15px}
+  .dashboard-metric-copy>span{font-size:8px}
+  .dashboard-metric-copy strong{font-size:21px}
+  .dashboard-metric-copy small{font-size:7px}
+  .metric-spark{right:9px;bottom:9px}
+  .dashboard-workspace-grid{grid-template-columns:1fr;gap:10px}
+  .dashboard-setup,.dashboard-actions{padding:17px}
+  .dashboard-action-grid{gap:7px}
+  .dashboard-action{grid-template-columns:28px minmax(0,1fr) 11px;gap:6px;padding:8px}
+  .dashboard-action-icon{width:27px;height:27px}
+  .dashboard-action b{font-size:7px}
+  .dashboard-action small{font-size:6px}
+  .dashboard-bottom-strip{align-items:flex-start}
+  .dashboard-bottom-strip .inline-link{display:none}
+  .dashboard-bottom-strip p{font-size:7px}
+  .site-footer{padding-top:34px}
+}
+@media(prefers-reduced-motion:reduce){
+  .dashboard-art-core,.dashboard-art-node{animation:none!important}
+  .app-nav-item,.dashboard-action{transition:none}
+}

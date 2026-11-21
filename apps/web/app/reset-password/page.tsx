@@ -1,0 +1,5 @@
+import Link from "next/link";
+import { ArrowLeft, KeyRound } from "lucide-react";
+import { AuthCard, AuthLayout } from "@/components/auth-layout";
+import { ResetPasswordForm } from "@/components/setup-forms";
+export default async function ResetPassword({searchParams}:{searchParams:Promise<{token?:string}>}){const {token=""}=await searchParams;return <AuthLayout scene="reset"><AuthCard title="Set a new password." description="Choose a strong password with at least 12 characters. You can sign in with it as soon as the reset completes.">{token?<ResetPasswordForm token={token}/>:<div className="auth-expired"><span><KeyRound size={18}/></span><p>This reset link is missing or expired. Request a new link to continue.</p><Link href="/forgot-password">Request a new link <ArrowLeft size={13}/></Link></div>}</AuthCard></AuthLayout>}
