@@ -1263,6 +1263,7 @@ app.post("/v1/domains/:domainId/verify", requireUser, async (req: AuthedRequest,
 });
 
 app.post("/v1/domains/:domainId/mail-setup", requireUser, async (req: AuthedRequest, res, next) => {
+  let setupStage = "load_domain";
   try {
     const [domain] = await db.select({
       id: domains.id, workspaceId: domains.workspaceId, domainName: domains.domainName,
@@ -1281,6 +1282,7 @@ app.post("/v1/domains/:domainId/mail-setup", requireUser, async (req: AuthedRequ
     let receivingEnabled = receivingSpecified ? req.body.receiving as boolean : domain.receivingEnabled;
     const existingProviderId = domain.sendingProviderDomainId ?? domain.resendDomainId;
     let providerDomain: ProviderDomain;
+    setupStage = existingProviderId ? "load_resend_domain" : "find_or_create_resend_domain";
     if (existingProviderId) {
       providerDomain = await provider.getDomain(existingProviderId);
     } else {
@@ -1288,15 +1290,18 @@ app.post("/v1/domains/:domainId/mail-setup", requireUser, async (req: AuthedRequ
       await db.update(domains).set({ sendingProvider: provider.id, sendingProviderDomainId: providerDomain.id, resendDomainId: provider.id === "resend" ? providerDomain.id : null, mailStatus: "pending" }).where(eq(domains.id, domain.id));
     }
     if (receivingSpecified) {
+      setupStage = "update_resend_capabilities";
       await provider.updateDomain(providerDomain.id, { sending: "enabled", receiving: receivingEnabled ? "enabled" : "disabled" });
       providerDomain = await provider.getDomain(providerDomain.id);
     }
     if (!receivingSpecified && ["enabled", "pending", "verified"].includes(providerDomain.capabilities?.receiving ?? "")) receivingEnabled = true;
     if (receivingEnabled && provider.id === "resend") {
+      setupStage = "enable_resend_receiving";
       providerDomain = await provider.enableForge(providerDomain.id);
     }
 
     const zoneId = process.env.NODE_ENV === "production" ? domain.cloudflareZoneId : process.env.CLOUDFLARE_ZONE_ID;
+    setupStage = "refresh_cloudflare_access";
     const oauthToken = process.env.NODE_ENV === "production" ? await freshCloudflareAccessToken(domain.id) : null;
     // Production writes are authorized by this workspace's OAuth grant and
     // the zone selected from the Cloudflare account that granted it.
@@ -1310,6 +1315,7 @@ app.post("/v1/domains/:domainId/mail-setup", requireUser, async (req: AuthedRequ
     const conflicts: MailDnsRecord[] = [];
     if (canWriteDns) {
       for (const record of dnsRecords) {
+        setupStage = "apply_cloudflare_dns";
         const type = record.type.toUpperCase();
         const name = normalizedDnsName(record.name, domain.domainName);
         const current = await cloudflareRequest<CloudflareDnsRecord[]>(`/zones/${encodeURIComponent(zoneId!)}/dns_records?type=${encodeURIComponent(type)}&name=${encodeURIComponent(name)}`, {}, oauthToken ?? undefined);
@@ -1336,6 +1342,7 @@ app.post("/v1/domains/:domainId/mail-setup", requireUser, async (req: AuthedRequ
         }, oauthToken ?? undefined);
         applied.push(`${type} ${name}`);
       }
+      setupStage = "verify_resend_domain";
       await provider.verifyDomain(providerDomain.id, receivingEnabled && provider.id === "resend" ? "forge" : undefined);
       providerDomain = await provider.getDomain(providerDomain.id);
       dnsRecords = [...(providerDomain.records ?? [])].sort((left, right) => {
@@ -1348,6 +1355,7 @@ app.post("/v1/domains/:domainId/mail-setup", requireUser, async (req: AuthedRequ
     const active = providerDomain.status === "verified";
     const receivingMx = dnsRecords.find((record) => record.type.toUpperCase() === "MX" && normalizedDnsName(record.name, domain.domainName) === domain.domainName);
     const receivingMxAvailable = Boolean(receivingMx);
+    setupStage = "save_mail_status";
     await db.update(domains).set({ mailStatus: active ? "active" : "pending", receivingEnabled }).where(eq(domains.id, domain.id));
     res.json({ success: true, data: {
       status: providerDomain.status,
@@ -1373,7 +1381,15 @@ app.post("/v1/domains/:domainId/mail-setup", requireUser, async (req: AuthedRequ
           : "Widesip supplied the DNS records. Add them in your DNS provider, then select Check mail DNS. Existing root MX records are not changed automatically.",
     } });
   } catch (error) {
-    return fail(res, 502, "MAIL_SETUP_FAILED", error instanceof Error ? error.message : "Could not prepare mail delivery setup.");
+    const message = error instanceof Error ? error.message : "Could not prepare mail delivery setup.";
+    console.error("[domain-mail-setup] failed", { domainId: String(req.params.domainId), stage: setupStage, message });
+    const origin = req.get("origin");
+    if (origin && allowedOrigins.has(origin)) {
+      res.setHeader("Access-Control-Allow-Origin", origin);
+      res.setHeader("Access-Control-Allow-Credentials", "true");
+      res.vary("Origin");
+    }
+    return fail(res, 502, "MAIL_SETUP_FAILED", message);
   }
 });
 
