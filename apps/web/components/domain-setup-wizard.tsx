@@ -19,6 +19,7 @@ export function DomainSetupWizard({ domainId }: { domainId: string }) {
   const [receiving, setReceiving] = useState(false);
   const [receivingTouched, setReceivingTouched] = useState(false);
   const [records, setRecords] = useState<DnsRecord[]>([]);
+  const [receivingStatusKnown, setReceivingStatusKnown] = useState(false);
   const [receivingMxAvailable, setReceivingMxAvailable] = useState(false);
   const [receivingMxStatus, setReceivingMxStatus] = useState("unknown");
   const [dnsConflicts, setDnsConflicts] = useState<DnsRecord[]>([]);
@@ -91,6 +92,7 @@ export function DomainSetupWizard({ domainId }: { domainId: string }) {
       if (!response.ok || !result.data) throw new Error(result.error?.message ?? "Could not prepare this domain's email setup.");
       setRecords(result.data.records ?? []); setDnsAutomated(Boolean(result.data.dnsAutomated)); setNotice(result.data.message);
       setReceivingMxAvailable(Boolean(result.data.receivingMxAvailable)); setDnsConflicts(result.data.conflicts ?? []);
+      setReceivingStatusKnown(true);
       setReceivingMxStatus(result.data.receivingMxStatus ?? "unknown");
       setDomain(current => current ? { ...current, mailStatus: result.data!.verified || result.data!.status === "verified" ? "active" : "pending", receivingEnabled: result.data!.receivingEnabled ?? receiving } : current);
       setReceiving(result.data.receivingEnabled ?? receiving); setReceivingTouched(false);
@@ -107,6 +109,7 @@ export function DomainSetupWizard({ domainId }: { domainId: string }) {
       if (!response.ok || !result.data) throw new Error(result.error?.message ?? "Could not check mail DNS.");
       if (result.data.records) setRecords(result.data.records);
       if (typeof result.data.receivingMxAvailable === "boolean") setReceivingMxAvailable(result.data.receivingMxAvailable);
+      if (typeof result.data.receivingMxAvailable === "boolean") setReceivingStatusKnown(true);
       setReceivingMxStatus(result.data.receivingMxStatus ?? "unknown");
       setNotice(result.data.message);
       if (result.data.verified) {
@@ -156,7 +159,7 @@ export function DomainSetupWizard({ domainId }: { domainId: string }) {
           <div className="domain-automation-note"><Waypoints size={15}/><p>{dnsAutomated ? `DNS automation is active for ${cloudflare?.zoneName ?? "the connected Cloudflare zone"}.` : "Add the displayed records at your DNS provider. Existing conflicting mail routes are left untouched."} {cloudflare?.connected ? "Cloudflare is linked to this organization." : "Connect Cloudflare to add compatible DNS records automatically."}</p></div>
           {!cloudflare?.connected && cloudflare?.configured && cloudflare.canManage && <div className="domain-wizard-actions"><button className="button secondary" type="button" disabled={busy} onClick={() => void connectCloudflare()}>{busy ? "Connecting…" : "Connect Cloudflare"}<ArrowRight size={15}/></button></div>}
           {records.length > 0 && <div className="sending-records"><b>{dnsAutomated ? (dnsConflicts.length ? "DNS records applied or needing action" : "DNS records applied by Widesip") : "DNS records to add"}</b><p>{receiving ? (receivingMxAvailable ? "Includes Resend's receiving MX. Check the status below before changing existing MX records." : "Sending records are available. Resend has not supplied the receiving MX yet, so incoming mail is not routed to Widesip.") : "These records authenticate sending. Incoming routing stays with your current mail provider."}</p><div className="table-wrap"><table className="table"><thead><tr><th>Type</th><th>Name / host</th><th>Value</th></tr></thead><tbody>{records.map((record,index)=><tr key={`${record.type}-${record.name}-${index}`}><td>{record.type}{record.type.toUpperCase()==="MX"&&record.priority!=null?` · ${record.priority}`:""}</td><td><code>{record.name}</code></td><td><code>{record.value}</code></td></tr>)}</tbody></table></div></div>}
-            {receiving && !receivingMxAvailable && <div className="domain-mx-warning" role="status"><CircleAlert size={17}/><p><b>Receiving is not ready yet.</b> Resend has not returned the receiving MX record for this domain. Widesip cannot route incoming mail until that record is available.</p></div>}
+            {receiving && receivingStatusKnown && !receivingMxAvailable && <div className="domain-mx-warning" role="status"><CircleAlert size={17}/><p><b>Receiving is not ready yet.</b> Resend has not returned the receiving MX record for this domain. Widesip cannot route incoming mail until that record is available.</p></div>}
             {receiving && receivingMxAvailable && dnsConflicts.some(record => record.type.toUpperCase() === "MX") && <div className="domain-mx-warning" role="status"><CircleAlert size={17}/><p><b>Incoming mail has not been switched yet.</b> Existing root MX records were left unchanged. To route all mail for this domain to Widesip, replace those records with the exact MX record shown above. This will stop the previous mail routing.</p></div>}
             {receiving && receivingMxAvailable && !dnsConflicts.some(record => record.type.toUpperCase() === "MX") && <div className="domain-webhook-guide"><b>{receivingMxStatus === "verified" ? "Receiving MX is verified" : "Receiving MX is waiting for DNS verification"}</b><p>{receivingMxStatus === "verified" ? "Resend has confirmed the receiving route. Incoming messages can now be delivered to Widesip." : "The required MX record is shown above. Add it at your DNS provider, replacing existing root MX records if you want all mail for this domain routed to Widesip, then select Check mail DNS."}</p></div>}
           <div className="domain-wizard-actions"><button className="button" disabled={busy} onClick={() => void setupMail()}>{busy ? "Preparing records…" : records.length ? "Refresh records and status" : "Prepare email setup"}<ArrowRight size={15}/></button>{records.length > 0 && <button className="button secondary" disabled={busy} onClick={() => void checkMail()}><RefreshCw size={14}/> Check mail DNS</button>}</div>

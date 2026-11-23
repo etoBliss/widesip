@@ -30,6 +30,10 @@ const navGroups: { label: string; items: NavItem[] }[] = [
 type Workspace = { id: string; name: string; type: string; role: string; hasVerifiedDomain?: boolean };
 type AccountUser = { name?: string; email?: string; image?: string | null };
 const api = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:4000";
+function selectableWorkspaces(rows: Workspace[]) {
+  const teamWorkspaces = rows.filter(row => row.type === "organization");
+  return teamWorkspaces.length ? teamWorkspaces : rows;
+}
 
 export function AppShell({ children }: { children: ReactNode }) {
   const pathname = usePathname();
@@ -64,9 +68,10 @@ export function AppShell({ children }: { children: ReactNode }) {
       .then((rows) => {
         if (!active || !rows) return;
         if (!rows.length) { router.replace("/onboarding"); return; }
-        setWorkspaces(rows);
+        const selectable = selectableWorkspaces(rows);
+        setWorkspaces(selectable);
         const saved = localStorage.getItem("widesip.workspace");
-        const current = rows.find((row) => row.id === saved) ?? rows[0];
+        const current = selectable.find((row) => row.id === saved) ?? selectable[0];
         localStorage.setItem("widesip.workspace", current.id);
         setWorkspace(current);
         setReady(true);
@@ -112,9 +117,10 @@ export function AppShell({ children }: { children: ReactNode }) {
       })
       .then(rows => {
         if (!active || !rows) return;
-        setWorkspaces(rows);
+        const selectable = selectableWorkspaces(rows);
+        setWorkspaces(selectable);
         const savedId = localStorage.getItem("widesip.workspace");
-        const current = rows.find(row => row.id === savedId) ?? rows[0];
+        const current = selectable.find(row => row.id === savedId) ?? selectable[0];
         if (current) {
           localStorage.setItem("widesip.workspace", current.id);
           setWorkspace(current);
@@ -206,35 +212,31 @@ export function AppShell({ children }: { children: ReactNode }) {
     ? [
         { label: "EMAIL & AUDIENCE", items: navGroups[0].items.filter(item => ["Inbox", "Addresses", "Contacts", "Campaigns"].includes(item.label)) },
         { label: "TEAM", items: navGroups[1].items.filter(item => item.label === "Team") },
-        { label: "PREFERENCES", items: navGroups[2].items.filter(item => item.label === "Settings") },
       ]
     : organizationWorkspace
-      ? navGroups
+      ? [navGroups[0], navGroups[1], { ...navGroups[2], items: navGroups[2].items.filter(item => item.label === "Usage & billing") }]
       : personalNeedsTeam
-        ? [
-            { label: "TEAM", items: navGroups[1].items.filter(item => item.label === "Team") },
-            { label: "PREFERENCES", items: navGroups[2].items.filter(item => item.label === "Settings") },
-          ]
-      : personalWorkspace
-        ? [
-            navGroups[0],
-            { label: "TEAM", items: navGroups[1].items.filter(item => item.label === "Team") },
-            { ...navGroups[2], items: navGroups[2].items.filter(item => item.label !== "Usage & billing") },
-          ]
+        ? [{ label: "TEAM", items: navGroups[1].items.filter(item => item.label === "Team") }]
+        : personalWorkspace
+        ? [{ label: "TEAM", items: navGroups[1].items.filter(item => item.label === "Team") }]
         : navGroups;
-  const memberAllowedPaths = ["/app/mail", "/app/mailboxes", "/app/contacts", "/app/campaigns", "/app/profile", "/app/team", "/app/team/invitations"];
+  const memberAllowedPaths = ["/app/mail", "/app/mailboxes", "/app/contacts", "/app/campaigns", "/app/profile", "/app/settings", "/app/team", "/app/team/invitations"];
+  const personalAllowedPaths = ["/app/profile", "/app/settings", "/app/team", "/app/team/invitations"];
   const personalTeamDashboard = workspace?.type === "personal" && pathname === "/app/team";
   const restrictedForMember = (memberLimited && !memberAllowedPaths.some(path => pathname === path || pathname.startsWith(`${path}/`)))
-    || (organizationWorkspace && pathname.startsWith("/app/settings"))
     || (personalWorkspace && pathname.startsWith("/app/billing"))
-    || (personalNeedsTeam && !["/app/team", "/app/team/invitations", "/app/profile", "/app/settings"].some(path => pathname === path || pathname.startsWith(`${path}/`)));
+    || (personalWorkspace && !personalAllowedPaths.some(path => pathname === path || pathname.startsWith(`${path}/`)));
+  const accountOnlyRoute = ["/app/profile", "/app/settings", "/app/team/invitations"].some(path => pathname === path || pathname.startsWith(`${path}/`));
+  const mustFinishDomainSetup = organizationNeedsDomain && !accountOnlyRoute;
   useEffect(() => {
-    if (!ready || !organizationNeedsDomain || pathname === "/app/domains" || pathname.startsWith("/app/domains/")) return;
+    if (!ready || !mustFinishDomainSetup || pathname === "/app/domains" || pathname.startsWith("/app/domains/")) return;
     router.replace("/app/domains");
-  }, [ready, organizationNeedsDomain, pathname, router]);
+  }, [ready, mustFinishDomainSetup, pathname, router]);
   const restrictionCopy = personalNeedsTeam
     ? "Join a team workspace to access this page. You can review and accept invitations from the Team section."
-    : personalWorkspace && pathname.startsWith("/app/billing")
+    : personalWorkspace
+      ? "Your personal space is limited to team access and account settings. Choose an organization workspace from the profile menu to use Widesip features."
+    : pathname.startsWith("/app/billing")
       ? "Usage and billing are only available in an organization workspace."
     : "Your role in this workspace does not include this page. Ask a workspace owner or admin if you need access.";
   function renderNavItem(item: NavItem) {
@@ -258,11 +260,11 @@ export function AppShell({ children }: { children: ReactNode }) {
           <button className="app-header-avatar account-menu-trigger" type="button" aria-label="Open account menu" aria-haspopup="menu" aria-expanded={accountMenuOpen} onClick={() => { setAccountMenuOpen(value => !value); setSignOutError(""); }}>
             {accountUser?.image ? <img className="account-trigger-image" src={accountUser.image} alt=""/> : (accountUser?.name?.trim() || accountUser?.email || workspace?.name || "W").slice(0, 1).toUpperCase()}
           </button>
-          {accountMenuOpen && <div className="account-menu-panel"><div className="account-menu-identity"><span className="account-menu-avatar">{accountUser?.image ? <img src={accountUser.image} alt=""/> : <UserRound size={16}/>}</span><span><b>{accountUser?.name || "Your account"}</b><small>{accountUser?.email || "Account profile"}</small></span></div><label className="account-workspace-switch"><span>Switch account or workspace</span>{workspaces.length > 0 ? <StyledSelect ariaLabel="Switch account or workspace" className="account-workspace-dropdown" value={workspace?.id ?? ""} disabled={refreshingWorkspaces && workspaces.length === 0} onValueChange={changeWorkspace} options={workspaces.map(row => ({ value: row.id, label: row.type === "personal" ? personalName : row.name, group: row.type === "personal" ? "Your spaces" : "Team workspaces", description: row.role === "member" ? "Member access" : row.role === "admin" ? "Admin access" : row.role === "owner" ? "Owner" : undefined }))}/> : <span className="account-workspace-empty">{refreshingWorkspaces ? "Loading workspaces…" : "No workspaces found"}</span>}{workspaceListError && <small className="account-workspace-error" role="status">{workspaceListError}</small>}{workspaces.length === 1 && !refreshingWorkspaces && <small className="account-workspace-hint">Only one workspace is available on this account. Accept a team invitation to add another.</small>}</label><div className="account-menu-divider"/><Link className="account-menu-item" href="/app/profile" onClick={() => setAccountMenuOpen(false)}><UserRound size={15}/>Profile</Link>{signOutError && <p className="account-menu-error" role="alert">{signOutError}</p>}<button className="account-menu-item account-menu-signout" type="button" onClick={() => void signOut()} disabled={signingOut}><LogOut size={15}/>{signingOut ? "Signing out…" : "Sign out"}</button></div>}
+          {accountMenuOpen && <div className="account-menu-panel"><div className="account-menu-identity"><span className="account-menu-avatar">{accountUser?.image ? <img src={accountUser.image} alt=""/> : <UserRound size={16}/>}</span><span><b>{accountUser?.name || "Your account"}</b><small>{accountUser?.email || "Account profile"}</small></span></div><label className="account-workspace-switch"><span>Switch workspace</span>{workspaces.length > 0 ? <StyledSelect ariaLabel="Switch workspace" className="account-workspace-dropdown" value={workspace?.id ?? ""} disabled={refreshingWorkspaces && workspaces.length === 0} onValueChange={changeWorkspace} options={workspaces.map(row => ({ value: row.id, label: row.type === "personal" ? personalName : row.name, group: row.type === "personal" ? "Your spaces" : "Team workspaces", description: row.role === "member" ? "Member access" : row.role === "admin" ? "Admin access" : row.role === "owner" ? "Owner" : undefined }))}/> : <span className="account-workspace-empty">{refreshingWorkspaces ? "Loading workspaces…" : "No workspaces found"}</span>}{workspaceListError && <small className="account-workspace-error" role="status">{workspaceListError}</small>}{workspaces.length === 1 && !refreshingWorkspaces && <small className="account-workspace-hint">{hasTeamWorkspace ? "Your available team workspace." : "Accept a team invitation to join an organization workspace."}</small>}</label><div className="account-menu-divider"/><Link className="account-menu-item" href="/app/profile" onClick={() => setAccountMenuOpen(false)}><UserRound size={15}/>Profile</Link><Link className="account-menu-item" href="/app/settings" onClick={() => setAccountMenuOpen(false)}><Settings2 size={15}/>Settings</Link>{signOutError && <p className="account-menu-error" role="alert">{signOutError}</p>}<button className="account-menu-item account-menu-signout" type="button" onClick={() => void signOut()} disabled={signingOut}><LogOut size={15}/>{signingOut ? "Signing out…" : "Sign out"}</button></div>}
         </div></div>
       </header>
       {workspaceReady && <details className="app-mobile-menu"><summary><Menu size={17}/><span>{currentPage}</span><ChevronDown size={15}/></summary><nav aria-label="Workspace navigation">{visibleGroups.map((group) => <div className="app-mobile-group" key={group.label}><span>{group.label}</span>{group.items.flatMap(item => [{ ...item }, ...(item.children ?? []).map(child => ({ ...child }))]).map(item => { const Icon = item.icon; return <Link key={item.href} className={isActive(item.href) ? "active" : ""} href={item.href} onClick={(event) => event.currentTarget.closest("details")?.removeAttribute("open")}><Icon size={15}/>{item.label}</Link>; })}</div>)}</nav></details>}
-      <main className="app-content">{!ready || !accountUserReady ? <div className="app-loading"><span className="loading-orbit"/>Loading your workspace…</div> : loadError ? <section className="app-card"><div className="empty" role="alert">{loadError}<br/><Link href="/sign-in" className="app-text-link">Return to sign in →</Link></div></section> : organizationNeedsDomain && pathname !== "/app/domains" && !pathname.startsWith("/app/domains/") ? <div className="app-loading"><span className="loading-orbit"/>Opening required domain setup…</div> : restrictedForMember ? <section className="member-restricted-board"><span><LockKeyhole size={19}/></span><h1>{personalNeedsTeam ? "Join a team to continue" : "Access restricted"}</h1><p>{restrictionCopy}</p>{personalNeedsTeam && <Link className="button secondary" href="/app/team/invitations"><MailCheck size={15}/>View team invitations<ArrowRight size={14}/></Link>}</section> : personalTeamDashboard ? <><div className="page-heading"><div><h1>Team</h1><p>Join an organization workspace with an invitation.</p></div></div><section className="app-card personal-team-dashboard"><span className="personal-team-icon"><UsersRound size={20}/></span><div><h2>Your account is personal</h2><p>You can join organization teams when invited. Organization accounts create workspaces and send team invitations; your personal inbox and data stay private.</p></div><div className="personal-team-actions"><Link className="button secondary" href="/app/team/invitations"><MailCheck size={15}/>View team invitations<ArrowRight size={14}/></Link></div></section></> : <div key={workspace?.id ?? "workspace"}>{children}</div>}</main>
+      <main className="app-content">{!ready || !accountUserReady ? <div className="app-loading"><span className="loading-orbit"/>Loading your workspace…</div> : loadError ? <section className="app-card"><div className="empty" role="alert">{loadError}<br/><Link href="/sign-in" className="app-text-link">Return to sign in →</Link></div></section> : mustFinishDomainSetup && pathname !== "/app/domains" && !pathname.startsWith("/app/domains/") ? <div className="app-loading"><span className="loading-orbit"/>Opening required domain setup…</div> : restrictedForMember ? <section className="member-restricted-board"><span><LockKeyhole size={19}/></span><h1>{personalNeedsTeam ? "Join a team to continue" : personalWorkspace ? "Personal workspace is unavailable" : "Access restricted"}</h1><p>{personalWorkspace ? "Your account can work in the organization workspaces you’ve joined. Choose a team from the profile menu. Profile and account security stay available there." : restrictionCopy}</p>{(personalNeedsTeam || personalWorkspace && hasTeamWorkspace) && <Link className="button secondary" href={personalNeedsTeam ? "/app/team/invitations" : "/app/mail"}>{personalNeedsTeam ? <><MailCheck size={15}/>View team invitations</> : <><ArrowRight size={14}/>Open team workspace</>}</Link>}</section> : personalTeamDashboard ? <><div className="page-heading"><div><h1>Team</h1><p>Join an organization workspace with an invitation.</p></div></div><section className="app-card personal-team-dashboard"><span className="personal-team-icon"><UsersRound size={20}/></span><div><h2>Your account is personal</h2><p>You can join organization teams when invited. Organization accounts create workspaces and send team invitations; your personal inbox and data stay private.</p></div><div className="personal-team-actions"><Link className="button secondary" href="/app/team/invitations"><MailCheck size={15}/>View team invitations<ArrowRight size={14}/></Link></div></section></> : <div key={workspace?.id ?? "workspace"}>{children}</div>}</main>
     </div>
   </div>;
 }

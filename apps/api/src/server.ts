@@ -19,6 +19,17 @@ type AuthedRequest = Request & { userId?: string };
 const app = express();
 const eventStreamPool = new Pool({ connectionString: process.env.DATABASE_URL, max: 32, application_name: "widesip-events" });
 const allowedOrigin = process.env.WEB_ORIGIN ?? "http://localhost:3000";
+const allowedOrigins = new Set([allowedOrigin]);
+try {
+  const configuredWebUrl = new URL(allowedOrigin);
+  if (["widesi.online", "www.widesi.online"].includes(configuredWebUrl.hostname)) {
+    for (const hostname of ["widesi.online", "www.widesi.online"]) {
+      const siteUrl = new URL(configuredWebUrl);
+      siteUrl.hostname = hostname;
+      allowedOrigins.add(siteUrl.origin);
+    }
+  }
+} catch { /* Keep the configured origin only if it is not a valid URL. */ }
 const verificationRecordName = "_widesip-verification";
 const challengeLifetimeMs = 30 * 24 * 60 * 60 * 1000;
 const usersWithPrivateSpaces = new Set<string>();
@@ -128,7 +139,7 @@ function htmlToSafeText(html: string | null) {
 }
 
 app.use(cors({
-  origin: allowedOrigin,
+  origin: (origin, callback) => callback(null, Boolean(origin && allowedOrigins.has(origin))),
   credentials: true,
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization", "Idempotency-Key", "x-captcha-response"],
@@ -207,7 +218,7 @@ app.post("/v1/webhooks/resend", express.raw({ type: "application/json", limit: "
 });
 app.use(express.json({ limit: "12mb" }));
 app.use("/v1", (req: AuthedRequest, res, next) => {
-  if (req.path.startsWith("/public/") || req.path.startsWith("/subscribe/") || req.path.startsWith("/subscribe-widget/") || req.path === "/webhooks/resend" || req.path === "/integrations/cloudflare/callback" || req.path === "/workspaces" && req.method === "GET" || req.path === "/account" || req.path.startsWith("/account/")) return next();
+  if (req.path.startsWith("/public/") || req.path.startsWith("/subscribe/") || req.path.startsWith("/subscribe-widget/") || req.path.startsWith("/unsubscribe/") || req.path === "/webhooks/resend" || req.path === "/integrations/cloudflare/callback" || req.path === "/workspaces" && req.method === "GET" || req.path === "/account" || req.path.startsWith("/account/")) return next();
   return requireUser(req, res, () => requireVerifiedOrganizationDomain(req, res, next));
 });
 app.use(campaignRouter);
@@ -290,41 +301,60 @@ async function memberCanUseMailbox(mailboxId: string, workspaceId: string, userI
 async function requireVerifiedOrganizationDomain(req: AuthedRequest, res: Response, next: NextFunction) {
   try {
     let workspaceId = String(req.params.workspaceId ?? req.query.workspaceId ?? req.body?.workspaceId ?? "");
-    const id = String(req.params.mailboxId ?? req.params.messageId ?? req.params.contactId ?? req.params.aliasId ?? req.params.domainId ?? req.params.campaignId ?? req.params.invitationId ?? "");
+    const [pathResource, pathId] = req.path.split("/").filter(Boolean);
+    const routeResource = ({ mailboxes: "mailbox", messages: "message", contacts: "contact", aliases: "alias", domains: "domain", campaigns: "campaign", invitations: "invitation", workspaces: "workspace" } as Record<string, string>)[pathResource ?? ""] ?? "";
+    const id = String(req.params.mailboxId ?? req.params.messageId ?? req.params.contactId ?? req.params.aliasId ?? req.params.domainId ?? req.params.campaignId ?? req.params.invitationId ?? (routeResource ? pathId : "") ?? "");
+    if (!workspaceId && routeResource === "workspace") workspaceId = id;
     if (!workspaceId && id) {
-      if (req.params.mailboxId) {
+      if (req.params.mailboxId || routeResource === "mailbox") {
         const [row] = await db.select({ workspaceId: mailboxes.workspaceId }).from(mailboxes).where(eq(mailboxes.id, id)).limit(1);
         workspaceId = row?.workspaceId ?? "";
-      } else if (req.params.messageId) {
+      } else if (req.params.messageId || routeResource === "message") {
         const [row] = await db.select({ workspaceId: messages.workspaceId }).from(messages).where(eq(messages.id, id)).limit(1);
         workspaceId = row?.workspaceId ?? "";
-      } else if (req.params.contactId) {
+      } else if (req.params.contactId || routeResource === "contact") {
         const [row] = await db.select({ workspaceId: contacts.workspaceId }).from(contacts).where(eq(contacts.id, id)).limit(1);
         workspaceId = row?.workspaceId ?? "";
-      } else if (req.params.aliasId) {
+      } else if (req.params.aliasId || routeResource === "alias") {
         const [row] = await db.select({ workspaceId: emailAliases.workspaceId }).from(emailAliases).where(eq(emailAliases.id, id)).limit(1);
         workspaceId = row?.workspaceId ?? "";
-      } else if (req.params.domainId) {
+      } else if (req.params.domainId || routeResource === "domain") {
         const [row] = await db.select({ workspaceId: domains.workspaceId }).from(domains).where(eq(domains.id, id)).limit(1);
         workspaceId = row?.workspaceId ?? "";
-      } else if (req.params.campaignId) {
+      } else if (req.params.campaignId || routeResource === "campaign") {
         const [row] = await db.select({ workspaceId: campaigns.workspaceId }).from(campaigns).where(eq(campaigns.id, id)).limit(1);
         workspaceId = row?.workspaceId ?? "";
-      } else if (req.params.invitationId) {
+      } else if (req.params.invitationId || routeResource === "invitation") {
         const [row] = await db.select({ workspaceId: workspaceInvitations.workspaceId }).from(workspaceInvitations).where(eq(workspaceInvitations.id, id)).limit(1);
         workspaceId = row?.workspaceId ?? "";
       }
     }
-    if (!workspaceId) return next();
+    const personalAccountRoute = req.path.startsWith("/team/") || req.path === "/team" || req.path.startsWith("/my/invitations") || req.path.startsWith("/invitations/") || req.path.startsWith("/security/") || req.path === "/security" || req.path === "/account" || req.path.startsWith("/account/");
+    if (!workspaceId) {
+      if (!personalAccountRoute) {
+        const [profile] = await db.select({ accountType: users.accountType }).from(users).where(eq(users.id, req.userId!)).limit(1);
+        if (profile?.accountType === "personal") {
+          const [teamAccess] = await db.select({ id: workspaces.id }).from(workspaces)
+            .innerJoin(workspaceMembers, eq(workspaceMembers.workspaceId, workspaces.id))
+            .where(and(eq(workspaceMembers.userId, req.userId!), eq(workspaces.type, "organization"))).limit(1);
+          if (teamAccess) return fail(res, 403, "TEAM_WORKSPACE_REQUIRED", "Choose a team workspace before using workspace features.");
+        }
+      }
+      return next();
+    }
     const [access] = await db.select({ type: workspaces.type, role: workspaceMembers.role }).from(workspaces)
       .innerJoin(workspaceMembers, eq(workspaceMembers.workspaceId, workspaces.id))
       .where(and(eq(workspaces.id, workspaceId), eq(workspaceMembers.userId, req.userId!))).limit(1);
     if (!access) return fail(res, 404, "WORKSPACE_NOT_FOUND", "The workspace could not be found.");
+    if (access.type === "organization" && access.role === "member" && (req.path === "/usage" || req.path.startsWith("/domains") || req.path.startsWith("/aliases"))) {
+      return fail(res, 403, "WORKSPACE_PAGE_RESTRICTED", "Your team role does not include this workspace page.");
+    }
     if (access.type === "personal") {
       const [teamAccess] = await db.select({ id: workspaces.id }).from(workspaces)
         .innerJoin(workspaceMembers, eq(workspaceMembers.workspaceId, workspaces.id))
         .where(and(eq(workspaceMembers.userId, req.userId!), eq(workspaces.type, "organization"))).limit(1);
       if (!teamAccess) return fail(res, 403, "TEAM_MEMBERSHIP_REQUIRED", "Join an organization team before accessing workspace features.");
+      return fail(res, 403, "PERSONAL_WORKSPACE_RESTRICTED", "Personal workspace features are unavailable after joining a team. Use an organization workspace.");
     }
     if (access.type === "organization") {
       const [verified] = await db.select({ id: domains.id }).from(domains)
@@ -652,7 +682,11 @@ app.get("/v1/workspaces", requireUser, async (req: AuthedRequest, res, next) => 
         .where(and(eq(domains.workspaceId, row.id), eq(domains.verificationStatus, "verified"))).limit(1);
       return { ...row, hasVerifiedDomain: Boolean(verified) };
     }));
-    res.json({ success: true, data: withDomainStatus });
+    const organizationWorkspaces = withDomainStatus.filter(row => row.type === "organization");
+    const selectableWorkspaces = profile.accountType === "personal" && organizationWorkspaces.length > 0
+      ? organizationWorkspaces
+      : withDomainStatus;
+    res.json({ success: true, data: selectableWorkspaces });
   } catch (error) {
     next(error);
   }

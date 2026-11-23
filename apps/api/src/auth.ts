@@ -15,7 +15,19 @@ const production=process.env.NODE_ENV==="production";
 if(production && (!turnstileSecret || !turnstileSiteKey)) throw new Error("Production auth requires TURNSTILE_SITE_KEY and TURNSTILE_SECRET_KEY.");
 if(production && (turnstileSiteKey==="1x00000000000000000000AA" || turnstileSecret==="1x0000000000000000000000000000000AA")) throw new Error("Cloudflare Turnstile test keys cannot be used in production.");
 if(production && !process.env.BETTER_AUTH_URL?.startsWith("https://")) throw new Error("BETTER_AUTH_URL must use HTTPS in production.");
-const authPlugins = production && turnstileSecret ? [captcha({provider:"cloudflare-turnstile",secretKey:turnstileSecret,endpoints:["/sign-in/email","/sign-up/email"],allowedHostnames:[new URL(process.env.WEB_ORIGIN??"http://localhost:3000").hostname]})] : [];
+function trustedWebOrigins() {
+  const configuredOrigin=process.env.WEB_ORIGIN??"http://localhost:3000";
+  const origins=new Set([configuredOrigin]);
+  try {
+    const configuredUrl=new URL(configuredOrigin);
+    if(["widesi.online","www.widesi.online"].includes(configuredUrl.hostname)){
+      for(const hostname of ["widesi.online","www.widesi.online"]){const siteUrl=new URL(configuredUrl);siteUrl.hostname=hostname;origins.add(siteUrl.origin);}
+    }
+  } catch { /* Keep the configured origin only if it is not a valid URL. */ }
+  return [...origins];
+}
+const webOrigins=trustedWebOrigins();
+const authPlugins = production && turnstileSecret ? [captcha({provider:"cloudflare-turnstile",secretKey:turnstileSecret,endpoints:["/sign-in/email","/sign-up/email"],allowedHostnames:webOrigins.map(origin=>new URL(origin).hostname)})] : [];
 function accountKey(email: unknown) {
   return createHmac("sha256", secret!).update(String(email ?? "").trim().toLowerCase()).digest("hex");
 }
@@ -32,7 +44,7 @@ async function recordFailedPassword(email: unknown) {
 }
 export const auth=betterAuth({
   secret, baseURL:process.env.BETTER_AUTH_URL,
-  trustedOrigins:[process.env.WEB_ORIGIN ?? "http://localhost:3000"],
+  trustedOrigins:webOrigins,
   onAPIError:{onError:(error)=>{console.error("[better-auth] API error",error instanceof Error?{name:error.name,message:error.message}:error);}},
   database:drizzleAdapter(db,{provider:"pg",schema:{user:users,session:sessions,account:accounts,verification:verifications,rateLimit:rateLimits}}),
   plugins:authPlugins,
